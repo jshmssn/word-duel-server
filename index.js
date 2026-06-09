@@ -294,6 +294,7 @@ io.on("connection", (socket) => {
 
     // Store pending ask
     room.pendingLetterAsk = { askerId: socket.id, letter };
+    clearTurnTimer(code);
 
     // Notify asker that we're waiting
     socket.emit("waiting-for-response", { action: "letter-ask", letter });
@@ -348,6 +349,7 @@ io.on("connection", (socket) => {
     if (!opponent) return;
 
     room.pendingLetterCount = { askerId: socket.id, letter };
+    clearTurnTimer(code);
 
     socket.emit("waiting-for-response", { action: "letter-count", letter });
 
