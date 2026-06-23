@@ -27,21 +27,53 @@ function pickCategory() {
   return wordsData.categories[Math.floor(Math.random() * wordsData.categories.length)];
 }
 
-function pickWord(category) {
-  const eligible = category.words.filter((w) => {
+function getEligibleWords(category) {
+  return category.words.filter((w) => {
     const letters = w.replace(/[^a-zA-Z]/g, "");
     return letters.length >= 5 && letters.length <= 10;
   });
+}
+
+function pickWord(category) {
+  const eligible = getEligibleWords(category);
   if (!eligible.length) return null;
   return eligible[Math.floor(Math.random() * eligible.length)];
 }
 
+function pickWordPair(category) {
+  const eligible = getEligibleWords(category);
+  const byLength = eligible.reduce((groups, word) => {
+    const length = getLetterCount(word);
+    if (!groups[length]) groups[length] = [];
+    groups[length].push(word);
+    return groups;
+  }, {});
+  const pairableGroups = Object.values(byLength).filter((group) => group.length >= 2);
+
+  if (!pairableGroups.length) {
+    const fallback = pickWord(category) || "";
+    return [fallback, fallback];
+  }
+
+  const group = pairableGroups[Math.floor(Math.random() * pairableGroups.length)];
+  const word1 = group[Math.floor(Math.random() * group.length)];
+  let word2 = group[Math.floor(Math.random() * group.length)];
+  let attempts = 0;
+
+  while (normalizeWord(word2) === normalizeWord(word1) && attempts < 30) {
+    word2 = group[Math.floor(Math.random() * group.length)];
+    attempts++;
+  }
+
+  return [word1, word2];
+}
+
 function getLetterCount(word) {
-  return word.replace(/[^a-zA-Z]/g, "").length;
+  return String(word || "").replace(/[^a-zA-Z]/g, "").length;
 }
 
 function normalizeWord(word) {
-  return word.toLowerCase().replace(/[^a-z]/g, "");
+  return String(word || "").toLowerCase().replace(/[^a-z]/g, "");
 }
 
 function sanitizeTurnDuration(turnDuration) {
@@ -92,11 +124,20 @@ function getExpandedConfirmedLetters(room, playerId) {
   );
 }
 
+function publicPlayers(room) {
+  return room.players.map((p) => ({
+    id: p.id,
+    username: p.username,
+    ready: p.ready,
+    wins: p.wins || 0,
+  }));
+}
+
 function broadcastReadyState(code) {
   const room = rooms[code];
   if (!room) return;
   io.to(code).emit("ready-update", {
-    players: room.players.map((p) => ({ id: p.id, username: p.username, ready: p.ready })),
+    players: publicPlayers(room),
     creatorId: room.creatorId,
   });
 }
@@ -187,7 +228,7 @@ io.on("connection", (socket) => {
     rooms[code] = {
       code,
       creatorId: socket.id,
-      players: [{ id: socket.id, username, ready: false }],
+      players: [{ id: socket.id, username, ready: false, wins: 0 }],
       state: "waiting",
       currentTurn: null,
       category: null,
@@ -222,13 +263,13 @@ io.on("connection", (socket) => {
     if (room.players.length >= 2) { socket.emit("join-error", { message: "Room is full." }); return; }
     if (room.state === "playing") { socket.emit("join-error", { message: "Game already in progress." }); return; }
 
-    room.players.push({ id: socket.id, username, ready: false });
+    room.players.push({ id: socket.id, username, ready: false, wins: 0 });
     socket.join(code);
 
     socket.emit("chat-history", { messages: room.chatHistory });
 
     io.to(code).emit("player-joined", {
-      players: room.players.map((p) => ({ id: p.id, username: p.username, ready: p.ready })),
+      players: publicPlayers(room),
       turnDuration: room.turnDuration,
       creatorId: room.creatorId,
     });
@@ -407,9 +448,12 @@ io.on("connection", (socket) => {
     if (correct) {
       clearTurnTimer(code);
       room.state = "ended";
+      guesser.wins = (guesser.wins || 0) + 1;
       io.to(code).emit("game-over", {
         winnerId: socket.id,
         winnerName: guesser.username,
+        winnerWins: guesser.wins,
+        players: publicPlayers(room),
         correctWord: room.words[opponent.id],
         loserWord: room.words[socket.id],
       });
@@ -432,7 +476,7 @@ io.on("connection", (socket) => {
     clearCountdown(code);
     clearTurnTimer(code);
     io.to(code).emit("rematch-lobby", {
-      players: room.players.map((p) => ({ id: p.id, username: p.username, ready: p.ready })),
+      players: publicPlayers(room),
       turnDuration: room.turnDuration,
       creatorId: room.creatorId,
     });
@@ -482,10 +526,7 @@ function startGame(code) {
   room.pendingLetterCount = null;
   room.players.forEach((p) => (p.ready = false));
 
-  let word1 = pickWord(category);
-  let word2 = pickWord(category);
-  let attempts = 0;
-  while (word2 === word1 && attempts < 20) { word2 = pickWord(category); attempts++; }
+  const [word1, word2] = pickWordPair(category);
 
   room.words[room.players[0].id] = word1;
   room.words[room.players[1].id] = word2;
@@ -500,7 +541,7 @@ function startGame(code) {
       myWordLetterCount: getLetterCount(myWord),
       opponentLetterCount: getLetterCount(opponentWord),
       currentTurn: room.currentTurn,
-      players: room.players.map((pl) => ({ id: pl.id, username: pl.username })),
+      players: publicPlayers(room),
       turnDuration: room.turnDuration,
     });
   });
