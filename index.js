@@ -168,7 +168,7 @@ function startCountdown(code) {
       if (count <= 0) {
         clearInterval(activeRoom.countdownInterval);
         activeRoom.countdownInterval = null;
-        startGame(code);
+        beginSlotMachine(code);
       } else {
         io.to(code).emit("countdown", { count });
       }
@@ -232,6 +232,8 @@ io.on("connection", (socket) => {
       state: "waiting",
       currentTurn: null,
       category: null,
+      pendingCategory: null,
+      slotDoneIds: null,
       words: {},
       confirmedLetters: {},
       guessAttempts: {},
@@ -261,7 +263,7 @@ io.on("connection", (socket) => {
     const room = rooms[code];
     if (!room) { socket.emit("join-error", { message: "Room not found." }); return; }
     if (room.players.length >= 2) { socket.emit("join-error", { message: "Room is full." }); return; }
-    if (room.state === "playing") { socket.emit("join-error", { message: "Game already in progress." }); return; }
+    if (room.state !== "waiting") { socket.emit("join-error", { message: "Game already in progress." }); return; }
 
     room.players.push({ id: socket.id, username, ready: false, wins: 0 });
     socket.join(code);
@@ -292,7 +294,7 @@ io.on("connection", (socket) => {
   // ── Toggle Ready ──
   socket.on("toggle-ready", ({ code }) => {
     const room = rooms[code];
-    if (!room || room.state === "playing") return;
+    if (!room || room.state !== "waiting") return;
     const player = room.players.find((p) => p.id === socket.id);
     if (!player) return;
     player.ready = !player.ready;
@@ -300,6 +302,21 @@ io.on("connection", (socket) => {
     const allReady = room.players.length === 2 && room.players.every((p) => p.ready);
     if (allReady) startCountdown(code);
     else clearCountdown(code);
+  });
+
+  socket.on("slot-machine-done", ({ code }) => {
+    const room = rooms[code];
+    if (!room || room.state !== "slotting" || !room.pendingCategory) return;
+    if (!room.players.some((p) => p.id === socket.id)) return;
+
+    if (!(room.slotDoneIds instanceof Set)) room.slotDoneIds = new Set();
+    room.slotDoneIds.add(socket.id);
+
+    const allDone =
+      room.players.length === 2 &&
+      room.players.every((p) => room.slotDoneIds.has(p.id));
+
+    if (allDone) startGame(code);
   });
 
   // ── Chat Message ──
@@ -473,6 +490,8 @@ io.on("connection", (socket) => {
     if (!room) return;
     room.players.forEach((p) => (p.ready = false));
     room.state = "waiting";
+    room.pendingCategory = null;
+    room.slotDoneIds = null;
     clearCountdown(code);
     clearTurnTimer(code);
     io.to(code).emit("rematch-lobby", {
@@ -499,6 +518,8 @@ io.on("connection", (socket) => {
           console.log(`[Room] ${code} deleted`);
         } else {
           room.state = "waiting";
+          room.pendingCategory = null;
+          room.slotDoneIds = null;
           if (!room.players.some((p) => p.id === room.creatorId)) {
             room.creatorId = room.players[0].id;
           }
@@ -513,13 +534,34 @@ io.on("connection", (socket) => {
 
 // ─── Game Functions ───────────────────────────────────────────────────────────
 
-function startGame(code) {
+function beginSlotMachine(code) {
   const room = rooms[code];
-  if (!room || room.players.length !== 2) return;
+  if (!room || room.state !== "waiting" || !roomReadyToStart(room)) return;
 
   const category = pickCategory();
   room.category = category.name;
+  room.pendingCategory = category;
+  room.slotDoneIds = new Set();
+  room.state = "slotting";
+
+  io.to(code).emit("category-selected", {
+    category: category.name,
+    selectedCategoryName: category.name,
+  });
+
+  console.log(`[Slot] ${code} | ${category.name}`);
+}
+
+function startGame(code) {
+  const room = rooms[code];
+  if (!room || room.players.length !== 2 || room.state === "playing") return;
+
+  const category = room.pendingCategory || pickCategory();
+  room.category = category.name;
   room.state = "playing";
+  room.pendingCategory = null;
+  room.slotDoneIds = null;
+  room.words = {};
   room.confirmedLetters = {};
   room.guessAttempts = {};
   room.pendingLetterAsk = null;
