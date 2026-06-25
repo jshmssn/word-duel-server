@@ -286,6 +286,7 @@ function createRoomState(code, creatorId, username, { withBot = false } = {}) {
     turnTimerInterval: null,
     botActionTimer: null,
     botAskedLetters: {},
+    botCountAskedLetters: {},
     botGuesses: {},
     pendingLetterAsk: null,
     pendingLetterCount: null,
@@ -774,6 +775,10 @@ function runBotTurn(code) {
   const confirmedCounts = getConfirmedLetterCounts(room, bot.id);
   const knownLetterCount = Object.values(confirmedCounts).reduce((total, count) => total + count, 0);
   const askedCount = (room.botAskedLetters[bot.id] || []).length;
+  const countAskedSet = new Set(room.botCountAskedLetters[bot.id] || []);
+  const countableLetters = Object.entries(confirmedCounts)
+    .filter(([letter, count]) => count > 0 && !countAskedSet.has(letter))
+    .map(([letter]) => letter);
   const shouldGuess =
     candidates.length === 1 ||
     (candidates.length <= 3 && knownLetterCount >= 2) ||
@@ -787,12 +792,11 @@ function runBotTurn(code) {
     return;
   }
 
-  const letter = chooseBotLetter(room, bot.id, human.id, candidates);
-  if (!room.botAskedLetters[bot.id]) room.botAskedLetters[bot.id] = [];
-  room.botAskedLetters[bot.id].push(letter);
-  clearTurnTimer(code);
-
-  if (Math.random() < 0.25 && knownLetterCount > 0) {
+  if (countableLetters.length > 0 && Math.random() < 0.25) {
+    const letter = countableLetters[Math.floor(Math.random() * countableLetters.length)];
+    if (!room.botCountAskedLetters[bot.id]) room.botCountAskedLetters[bot.id] = [];
+    room.botCountAskedLetters[bot.id].push(letter);
+    clearTurnTimer(code);
     room.pendingLetterCount = { askerId: bot.id, letter };
     io.to(human.id).emit("letter-count-prompt", {
       askerName: bot.username,
@@ -800,6 +804,11 @@ function runBotTurn(code) {
     });
     return;
   }
+
+  const letter = chooseBotLetter(room, bot.id, human.id, candidates);
+  if (!room.botAskedLetters[bot.id]) room.botAskedLetters[bot.id] = [];
+  room.botAskedLetters[bot.id].push(letter);
+  clearTurnTimer(code);
 
   room.pendingLetterAsk = { askerId: bot.id, letter };
   io.to(human.id).emit("letter-ask-prompt", {
@@ -822,6 +831,7 @@ function startGame(code) {
   room.confirmedLetters = {};
   room.guessAttempts = {};
   room.botAskedLetters = {};
+  room.botCountAskedLetters = {};
   room.botGuesses = {};
   room.pendingLetterAsk = null;
   room.pendingLetterCount = null;
