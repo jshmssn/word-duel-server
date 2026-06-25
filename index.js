@@ -81,6 +81,27 @@ function sanitizeTurnDuration(turnDuration) {
   return [0, 30, 45, 60].includes(duration) ? duration : 0;
 }
 
+function sanitizeRoundLimit(roundLimit) {
+  const limit = Number(roundLimit) || 1;
+  return [1, 3, 5].includes(limit) ? limit : 1;
+}
+
+function getWinsToSeries(roundLimit) {
+  return Math.floor(sanitizeRoundLimit(roundLimit) / 2) + 1;
+}
+
+function getBotId(code) {
+  return `bot:${code}`;
+}
+
+function isBotPlayer(player) {
+  return Boolean(player && player.isBot);
+}
+
+function getHumanPlayers(room) {
+  return room.players.filter((p) => !isBotPlayer(p));
+}
+
 function getConfirmedLetterCounts(room, playerId) {
   const existing = room.confirmedLetters[playerId];
   if (!existing) {
@@ -130,6 +151,7 @@ function publicPlayers(room) {
     username: p.username,
     ready: p.ready,
     wins: p.wins || 0,
+    isBot: Boolean(p.isBot),
   }));
 }
 
@@ -189,6 +211,8 @@ function clearCountdown(code) {
 function startTurnTimer(code) {
   const room = rooms[code];
   if (!room || !room.turnDuration) return;
+  const currentPlayer = room.players.find((p) => p.id === room.currentTurn);
+  if (isBotPlayer(currentPlayer)) return;
   clearTurnTimer(code);
 
   let remaining = room.turnDuration;
@@ -217,6 +241,57 @@ function clearTurnTimer(code) {
 
 // ─── Socket Events ───────────────────────────────────────────────────────────
 
+function clearBotTimer(code) {
+  const room = rooms[code];
+  if (!room) return;
+  if (room.botActionTimer) {
+    clearTimeout(room.botActionTimer);
+    room.botActionTimer = null;
+  }
+}
+
+function createRoomState(code, creatorId, username, { withBot = false } = {}) {
+  const players = [{ id: creatorId, username, ready: false, wins: 0 }];
+
+  if (withBot) {
+    players.push({
+      id: getBotId(code),
+      username: "Word Bot",
+      ready: true,
+      wins: 0,
+      isBot: true,
+    });
+  }
+
+  return {
+    code,
+    creatorId,
+    players,
+    mode: withBot ? "bot" : "duel",
+    state: "waiting",
+    currentTurn: null,
+    category: null,
+    categoryData: null,
+    pendingCategory: null,
+    slotDoneIds: null,
+    words: {},
+    confirmedLetters: {},
+    guessAttempts: {},
+    chatHistory: [],
+    countdownDelay: null,
+    countdownInterval: null,
+    turnDuration: 0,
+    roundLimit: 1,
+    seriesOver: false,
+    turnTimerInterval: null,
+    botActionTimer: null,
+    botAskedLetters: {},
+    botGuesses: {},
+    pendingLetterAsk: null,
+    pendingLetterCount: null,
+  };
+}
+
 io.on("connection", (socket) => {
   console.log(`[+] Connected: ${socket.id}`);
 
@@ -225,37 +300,35 @@ io.on("connection", (socket) => {
     let code;
     do { code = generateRoomCode(); } while (rooms[code]);
 
-    rooms[code] = {
-      code,
-      creatorId: socket.id,
-      players: [{ id: socket.id, username, ready: false, wins: 0 }],
-      state: "waiting",
-      currentTurn: null,
-      category: null,
-      pendingCategory: null,
-      slotDoneIds: null,
-      words: {},
-      confirmedLetters: {},
-      guessAttempts: {},
-      chatHistory: [],
-      countdownDelay: null,
-      countdownInterval: null,
-      // Turn timer: 0 means no timer
-      turnDuration: 0,
-      turnTimerInterval: null,
-      // Pending letter ask
-      pendingLetterAsk: null,
-      // Pending letter count ask
-      pendingLetterCount: null,
-    };
+    rooms[code] = createRoomState(code, socket.id, username);
 
     socket.join(code);
     socket.emit("room-created", {
       code,
       creatorId: socket.id,
       turnDuration: rooms[code].turnDuration,
+      roundLimit: rooms[code].roundLimit,
+      players: publicPlayers(rooms[code]),
     });
     console.log(`[Room] ${code} created by ${username}`);
+  });
+
+  socket.on("create-bot-room", ({ username }) => {
+    let code;
+    do { code = generateRoomCode(); } while (rooms[code]);
+
+    rooms[code] = createRoomState(code, socket.id, username, { withBot: true });
+
+    socket.join(code);
+    socket.emit("room-created", {
+      code,
+      creatorId: socket.id,
+      turnDuration: rooms[code].turnDuration,
+      roundLimit: rooms[code].roundLimit,
+      players: publicPlayers(rooms[code]),
+      mode: rooms[code].mode,
+    });
+    console.log(`[Bot Room] ${code} created by ${username}`);
   });
 
   // ── Join Room ──
@@ -273,7 +346,9 @@ io.on("connection", (socket) => {
     io.to(code).emit("player-joined", {
       players: publicPlayers(room),
       turnDuration: room.turnDuration,
+      roundLimit: room.roundLimit,
       creatorId: room.creatorId,
+      mode: room.mode,
     });
 
     console.log(`[Room] ${username} joined ${code}`);
@@ -287,6 +362,17 @@ io.on("connection", (socket) => {
     room.turnDuration = sanitizeTurnDuration(turnDuration);
     io.to(code).emit("turn-duration-update", {
       turnDuration: room.turnDuration,
+      creatorId: room.creatorId,
+    });
+  });
+
+  socket.on("set-round-limit", ({ code, roundLimit }) => {
+    const room = rooms[code];
+    if (!room || room.state !== "waiting" || room.creatorId !== socket.id) return;
+
+    room.roundLimit = sanitizeRoundLimit(roundLimit);
+    io.to(code).emit("round-limit-update", {
+      roundLimit: room.roundLimit,
       creatorId: room.creatorId,
     });
   });
@@ -314,7 +400,7 @@ io.on("connection", (socket) => {
 
     const allDone =
       room.players.length === 2 &&
-      room.players.every((p) => room.slotDoneIds.has(p.id));
+      getHumanPlayers(room).every((p) => room.slotDoneIds.has(p.id));
 
     if (allDone) startGame(code);
   });
@@ -357,6 +443,12 @@ io.on("connection", (socket) => {
     // Notify asker that we're waiting
     socket.emit("waiting-for-response", { action: "letter-ask", letter });
 
+    if (isBotPlayer(opponent)) {
+      const hasLetter = getLetterFrequency(room.words[opponent.id], letter) > 0;
+      setTimeout(() => answerPendingLetterAsk(code, opponent.id, hasLetter), 700);
+      return;
+    }
+
     // Prompt opponent
     io.to(opponent.id).emit("letter-ask-prompt", {
       askerName: room.players.find((p) => p.id === socket.id).username,
@@ -366,33 +458,7 @@ io.on("connection", (socket) => {
 
   // ── Answer Letter Ask ── (opponent responds Yes/No)
   socket.on("answer-letter-ask", ({ code, answer }) => {
-    const room = rooms[code];
-    if (!room || room.state !== "playing") return;
-    if (!room.pendingLetterAsk) return;
-
-    const { askerId, letter } = room.pendingLetterAsk;
-    room.pendingLetterAsk = null;
-
-    // Verify this is actually the opponent of the asker
-    const opponent = room.players.find((p) => p.id === askerId);
-    if (!opponent || socket.id === askerId) return;
-
-    const hasLetter = answer === true || answer === "yes";
-
-    if (hasLetter) {
-      const counts = getConfirmedLetterCounts(room, askerId);
-      setConfirmedLetterCount(room, askerId, letter, Math.max(counts[letter] || 0, 1));
-    }
-
-    io.to(code).emit("letter-result", {
-      askerId,
-      askerName: room.players.find((p) => p.id === askerId).username,
-      letter,
-      hasLetter,
-      confirmedLetters: getExpandedConfirmedLetters(room, askerId),
-    });
-
-    passTurn(code);
+    answerPendingLetterAsk(code, socket.id, answer);
   });
 
   // ── Ask Letter Count ──
@@ -411,6 +477,12 @@ io.on("connection", (socket) => {
 
     socket.emit("waiting-for-response", { action: "letter-count", letter });
 
+    if (isBotPlayer(opponent)) {
+      const count = getLetterFrequency(room.words[opponent.id], letter);
+      setTimeout(() => answerPendingLetterCount(code, opponent.id, count), 700);
+      return;
+    }
+
     io.to(opponent.id).emit("letter-count-prompt", {
       askerName: room.players.find((p) => p.id === socket.id).username,
       letter,
@@ -419,30 +491,7 @@ io.on("connection", (socket) => {
 
   // ── Answer Letter Count ──
   socket.on("answer-letter-count", ({ code, count }) => {
-    const room = rooms[code];
-    if (!room || room.state !== "playing") return;
-    if (!room.pendingLetterCount) return;
-
-    const { askerId, letter } = room.pendingLetterCount;
-    room.pendingLetterCount = null;
-
-    if (socket.id === askerId) return;
-
-    const numCount = parseInt(count, 10);
-    if (isNaN(numCount) || numCount < 0) return;
-
-    setConfirmedLetterCount(room, askerId, letter, numCount);
-
-    io.to(code).emit("letter-count-result", {
-      askerId,
-      askerName: room.players.find((p) => p.id === askerId)?.username,
-      responderName: room.players.find((p) => p.id === socket.id)?.username,
-      letter,
-      count: numCount,
-      confirmedLetters: getExpandedConfirmedLetters(room, askerId),
-    });
-
-    passTurn(code);
+    answerPendingLetterCount(code, socket.id, count);
   });
 
   // ── Guess Word ──
@@ -450,53 +499,28 @@ io.on("connection", (socket) => {
     const room = rooms[code];
     if (!room || room.state !== "playing") return;
     if (room.currentTurn !== socket.id) { socket.emit("not-your-turn"); return; }
-
-    const opponent = room.players.find((p) => p.id !== socket.id);
-    const guesser = room.players.find((p) => p.id === socket.id);
-    if (!opponent) return;
-
-    const opponentWord = normalizeWord(room.words[opponent.id] || "");
-    const normalizedGuess = normalizeWord(guess);
-    const correct = normalizedGuess === opponentWord;
-
-    if (!room.guessAttempts[socket.id]) room.guessAttempts[socket.id] = 0;
-    room.guessAttempts[socket.id]++;
-
-    if (correct) {
-      clearTurnTimer(code);
-      room.state = "ended";
-      guesser.wins = (guesser.wins || 0) + 1;
-      io.to(code).emit("game-over", {
-        winnerId: socket.id,
-        winnerName: guesser.username,
-        winnerWins: guesser.wins,
-        players: publicPlayers(room),
-        correctWord: room.words[opponent.id],
-        loserWord: room.words[socket.id],
-      });
-    } else {
-      io.to(code).emit("wrong-guess", {
-        guesserId: socket.id,
-        guesserName: guesser.username,
-        guess,
-      });
-      passTurn(code);
-    }
+    finishGuess(code, socket.id, guess);
   });
 
   // ── Rematch ──
   socket.on("rematch", ({ code }) => {
     const room = rooms[code];
     if (!room) return;
-    room.players.forEach((p) => (p.ready = false));
+    if (room.seriesOver && room.roundLimit > 1) {
+      room.players.forEach((p) => (p.wins = 0));
+    }
+    room.seriesOver = false;
+    room.players.forEach((p) => (p.ready = isBotPlayer(p)));
     room.state = "waiting";
     room.pendingCategory = null;
     room.slotDoneIds = null;
     clearCountdown(code);
     clearTurnTimer(code);
+    clearBotTimer(code);
     io.to(code).emit("rematch-lobby", {
       players: publicPlayers(room),
       turnDuration: room.turnDuration,
+      roundLimit: room.roundLimit,
       creatorId: room.creatorId,
     });
   });
@@ -511,9 +535,10 @@ io.on("connection", (socket) => {
         const left = room.players[idx];
         clearCountdown(code);
         clearTurnTimer(code);
+        clearBotTimer(code);
         room.players.splice(idx, 1);
         io.to(code).emit("player-left", { username: left.username, disconnected: true });
-        if (room.players.length === 0) {
+        if (room.players.length === 0 || room.players.every((p) => isBotPlayer(p))) {
           delete rooms[code];
           console.log(`[Room] ${code} deleted`);
         } else {
@@ -523,7 +548,7 @@ io.on("connection", (socket) => {
           if (!room.players.some((p) => p.id === room.creatorId)) {
             room.creatorId = room.players[0].id;
           }
-          room.players.forEach((p) => (p.ready = false));
+          room.players.forEach((p) => (p.ready = isBotPlayer(p)));
           broadcastReadyState(code);
         }
         break;
@@ -552,18 +577,252 @@ function beginSlotMachine(code) {
   console.log(`[Slot] ${code} | ${category.name}`);
 }
 
+function getOpponent(room, playerId) {
+  return room.players.find((p) => p.id !== playerId);
+}
+
+function getLetterFrequency(word, letter) {
+  const normalizedLetter = String(letter || "").toUpperCase();
+  return String(word || "")
+    .toUpperCase()
+    .split("")
+    .filter((char) => char === normalizedLetter).length;
+}
+
+function answerPendingLetterAsk(code, responderId, answer) {
+  const room = rooms[code];
+  if (!room || room.state !== "playing" || !room.pendingLetterAsk) return;
+
+  const { askerId, letter } = room.pendingLetterAsk;
+  if (responderId === askerId) return;
+
+  const asker = room.players.find((p) => p.id === askerId);
+  const responder = room.players.find((p) => p.id === responderId);
+  if (!asker || !responder) return;
+
+  room.pendingLetterAsk = null;
+  const hasLetter = answer === true || answer === "yes";
+
+  if (hasLetter) {
+    const counts = getConfirmedLetterCounts(room, askerId);
+    setConfirmedLetterCount(room, askerId, letter, Math.max(counts[letter] || 0, 1));
+  }
+
+  io.to(code).emit("letter-result", {
+    askerId,
+    askerName: asker.username,
+    letter,
+    hasLetter,
+    confirmedLetters: getExpandedConfirmedLetters(room, askerId),
+  });
+
+  passTurn(code);
+}
+
+function answerPendingLetterCount(code, responderId, count) {
+  const room = rooms[code];
+  if (!room || room.state !== "playing" || !room.pendingLetterCount) return;
+
+  const { askerId, letter } = room.pendingLetterCount;
+  if (responderId === askerId) return;
+
+  const asker = room.players.find((p) => p.id === askerId);
+  const responder = room.players.find((p) => p.id === responderId);
+  const numCount = parseInt(count, 10);
+  if (!asker || !responder || isNaN(numCount) || numCount < 0) return;
+
+  room.pendingLetterCount = null;
+  setConfirmedLetterCount(room, askerId, letter, numCount);
+
+  io.to(code).emit("letter-count-result", {
+    askerId,
+    askerName: asker.username,
+    responderName: responder.username,
+    letter,
+    count: numCount,
+    confirmedLetters: getExpandedConfirmedLetters(room, askerId),
+  });
+
+  passTurn(code);
+}
+
+function getSeriesState(room, winnerId) {
+  const roundLimit = sanitizeRoundLimit(room.roundLimit);
+  const winsToSeries = getWinsToSeries(roundLimit);
+  const winner = room.players.find((p) => p.id === winnerId);
+  const roundNumber = room.players.reduce((total, p) => total + (p.wins || 0), 0);
+  const seriesOver = Boolean(winner && (winner.wins || 0) >= winsToSeries);
+
+  return {
+    roundLimit,
+    roundNumber,
+    winsToSeries,
+    seriesOver,
+    seriesWinnerId: seriesOver ? winner.id : null,
+    seriesWinnerName: seriesOver ? winner.username : null,
+  };
+}
+
+function finishGuess(code, guesserId, guess) {
+  const room = rooms[code];
+  if (!room || room.state !== "playing") return;
+  if (room.currentTurn !== guesserId) return;
+
+  const opponent = getOpponent(room, guesserId);
+  const guesser = room.players.find((p) => p.id === guesserId);
+  if (!opponent || !guesser) return;
+
+  const opponentWord = normalizeWord(room.words[opponent.id] || "");
+  const normalizedGuess = normalizeWord(guess);
+  const correct = normalizedGuess === opponentWord;
+
+  if (!room.guessAttempts[guesserId]) room.guessAttempts[guesserId] = 0;
+  room.guessAttempts[guesserId]++;
+
+  if (correct) {
+    clearTurnTimer(code);
+    clearBotTimer(code);
+    room.state = "ended";
+    guesser.wins = (guesser.wins || 0) + 1;
+    const seriesState = getSeriesState(room, guesserId);
+    room.seriesOver = seriesState.seriesOver;
+
+    io.to(code).emit("game-over", {
+      winnerId: guesserId,
+      winnerName: guesser.username,
+      winnerWins: guesser.wins,
+      players: publicPlayers(room),
+      correctWord: room.words[opponent.id],
+      loserWord: room.words[guesserId],
+      wordsByPlayer: room.words,
+      ...seriesState,
+    });
+    return;
+  }
+
+  io.to(code).emit("wrong-guess", {
+    guesserId,
+    guesserName: guesser.username,
+    guess,
+  });
+  passTurn(code);
+}
+
+function hasRequiredLetterCounts(word, counts) {
+  return Object.entries(counts).every(
+    ([letter, count]) => getLetterFrequency(word, letter) >= count,
+  );
+}
+
+function getBotCandidates(room, botId, targetId) {
+  const category = room.categoryData;
+  const targetLength = getLetterCount(room.words[targetId] || "");
+  const confirmedCounts = getConfirmedLetterCounts(room, botId);
+  const guessed = new Set((room.botGuesses[botId] || []).map(normalizeWord));
+  const source = category ? getEligibleWords(category) : [];
+  const candidates = source.filter(
+    (word) =>
+      getLetterCount(word) === targetLength &&
+      hasRequiredLetterCounts(word, confirmedCounts) &&
+      !guessed.has(normalizeWord(word)),
+  );
+
+  return candidates.length ? candidates : source.filter((word) => getLetterCount(word) === targetLength);
+}
+
+function chooseBotLetter(room, botId, targetId, candidates) {
+  const asked = room.botAskedLetters[botId] || [];
+  const askedSet = new Set(asked);
+  const confirmed = getConfirmedLetterCounts(room, botId);
+  const candidateLetters = candidates
+    .join("")
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "")
+    .split("")
+    .filter((letter) => !askedSet.has(letter) && !confirmed[letter]);
+  const commonLetters = "ETAOINSHRDLUCMFWYPVBGKQJXZ".split("");
+  const pool = candidateLetters.length ? candidateLetters : commonLetters;
+  const scored = pool.reduce((counts, letter) => {
+    if (!askedSet.has(letter) && !confirmed[letter]) counts[letter] = (counts[letter] || 0) + 1;
+    return counts;
+  }, {});
+  const sorted = Object.entries(scored).sort((a, b) => b[1] - a[1]);
+  return sorted[0]?.[0] || commonLetters.find((letter) => !askedSet.has(letter)) || "E";
+}
+
+function scheduleBotTurnIfNeeded(code) {
+  const room = rooms[code];
+  if (!room || room.state !== "playing") return;
+  clearBotTimer(code);
+
+  const bot = room.players.find((p) => p.id === room.currentTurn && isBotPlayer(p));
+  if (!bot || room.pendingLetterAsk || room.pendingLetterCount) return;
+
+  room.botActionTimer = setTimeout(() => runBotTurn(code), 900 + Math.random() * 800);
+}
+
+function runBotTurn(code) {
+  const room = rooms[code];
+  if (!room || room.state !== "playing") return;
+  const bot = room.players.find((p) => p.id === room.currentTurn && isBotPlayer(p));
+  if (!bot || room.pendingLetterAsk || room.pendingLetterCount) return;
+
+  const human = getOpponent(room, bot.id);
+  if (!human) return;
+
+  const candidates = getBotCandidates(room, bot.id, human.id);
+  const confirmedCounts = getConfirmedLetterCounts(room, bot.id);
+  const knownLetterCount = Object.values(confirmedCounts).reduce((total, count) => total + count, 0);
+  const askedCount = (room.botAskedLetters[bot.id] || []).length;
+  const shouldGuess =
+    candidates.length === 1 ||
+    (candidates.length <= 3 && knownLetterCount >= 2) ||
+    (askedCount >= 6 && candidates.length > 0 && Math.random() < 0.45);
+
+  if (shouldGuess && candidates.length) {
+    const guess = candidates[Math.floor(Math.random() * candidates.length)];
+    if (!room.botGuesses[bot.id]) room.botGuesses[bot.id] = [];
+    room.botGuesses[bot.id].push(guess);
+    finishGuess(code, bot.id, guess);
+    return;
+  }
+
+  const letter = chooseBotLetter(room, bot.id, human.id, candidates);
+  if (!room.botAskedLetters[bot.id]) room.botAskedLetters[bot.id] = [];
+  room.botAskedLetters[bot.id].push(letter);
+  clearTurnTimer(code);
+
+  if (Math.random() < 0.25 && knownLetterCount > 0) {
+    room.pendingLetterCount = { askerId: bot.id, letter };
+    io.to(human.id).emit("letter-count-prompt", {
+      askerName: bot.username,
+      letter,
+    });
+    return;
+  }
+
+  room.pendingLetterAsk = { askerId: bot.id, letter };
+  io.to(human.id).emit("letter-ask-prompt", {
+    askerName: bot.username,
+    letter,
+  });
+}
+
 function startGame(code) {
   const room = rooms[code];
   if (!room || room.players.length !== 2 || room.state === "playing") return;
 
   const category = room.pendingCategory || pickCategory();
   room.category = category.name;
+  room.categoryData = category;
   room.state = "playing";
   room.pendingCategory = null;
   room.slotDoneIds = null;
   room.words = {};
   room.confirmedLetters = {};
   room.guessAttempts = {};
+  room.botAskedLetters = {};
+  room.botGuesses = {};
   room.pendingLetterAsk = null;
   room.pendingLetterCount = null;
   room.players.forEach((p) => (p.ready = false));
@@ -577,6 +836,7 @@ function startGame(code) {
   room.players.forEach((p) => {
     const myWord = room.words[p.id];
     const opponentWord = room.words[room.players.find((op) => op.id !== p.id).id];
+    if (isBotPlayer(p)) return;
     io.to(p.id).emit("game-start", {
       category: category.name,
       myWord,
@@ -585,10 +845,13 @@ function startGame(code) {
       currentTurn: room.currentTurn,
       players: publicPlayers(room),
       turnDuration: room.turnDuration,
+      roundLimit: room.roundLimit,
     });
   });
 
-  if (room.turnDuration > 0) startTurnTimer(code);
+  const currentPlayer = room.players.find((p) => p.id === room.currentTurn);
+  if (isBotPlayer(currentPlayer)) scheduleBotTurnIfNeeded(code);
+  else if (room.turnDuration > 0) startTurnTimer(code);
 
   console.log(`[Game] ${code} | ${category.name} | ${word1} vs ${word2}`);
 }
@@ -602,7 +865,8 @@ function passTurn(code, fromTimeout = false) {
     room.pendingLetterAsk = null;
     room.pendingLetterCount = null;
     io.to(code).emit("turn-change", { currentTurn: room.currentTurn, fromTimeout });
-    if (room.turnDuration > 0) startTurnTimer(code);
+    if (isBotPlayer(other)) scheduleBotTurnIfNeeded(code);
+    else if (room.turnDuration > 0) startTurnTimer(code);
   }
 }
 
