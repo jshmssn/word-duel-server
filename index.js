@@ -23,8 +23,51 @@ function generateRoomCode() {
   return code;
 }
 
-function pickCategory() {
-  return wordsData.categories[Math.floor(Math.random() * wordsData.categories.length)];
+function shuffleItems(items) {
+  const shuffled = [...items];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
+function getCategoryByName(name) {
+  return wordsData.categories.find((category) => category.name === name) || null;
+}
+
+function refillCategoryBag(room) {
+  const names = shuffleItems(wordsData.categories.map((category) => category.name));
+
+  if (room?.category && names.length > 1 && names[0] === room.category) {
+    const swapIndex = names.findIndex((name) => name !== room.category);
+    [names[0], names[swapIndex]] = [names[swapIndex], names[0]];
+  }
+
+  room.categoryBag = names;
+}
+
+function pickCategory(room = null) {
+  if (!wordsData.categories.length) return null;
+  if (!room) {
+    return wordsData.categories[Math.floor(Math.random() * wordsData.categories.length)];
+  }
+
+  if (!Array.isArray(room.categoryBag) || room.categoryBag.length === 0) {
+    refillCategoryBag(room);
+  }
+
+  let category = null;
+  while (room.categoryBag.length > 0 && !category) {
+    category = getCategoryByName(room.categoryBag.shift());
+  }
+
+  if (!category) {
+    refillCategoryBag(room);
+    category = getCategoryByName(room.categoryBag.shift());
+  }
+
+  return category || wordsData.categories[Math.floor(Math.random() * wordsData.categories.length)];
 }
 
 function getEligibleWords(category) {
@@ -273,6 +316,7 @@ function createRoomState(code, creatorId, username, { withBot = false } = {}) {
     category: null,
     categoryData: null,
     pendingCategory: null,
+    categoryBag: [],
     slotDoneIds: null,
     words: {},
     confirmedLetters: {},
@@ -564,7 +608,8 @@ function beginSlotMachine(code) {
   const room = rooms[code];
   if (!room || room.state !== "waiting" || !roomReadyToStart(room)) return;
 
-  const category = pickCategory();
+  const category = pickCategory(room);
+  if (!category) return;
   room.category = category.name;
   room.pendingCategory = category;
   room.slotDoneIds = new Set();
@@ -821,7 +866,8 @@ function startGame(code) {
   const room = rooms[code];
   if (!room || room.players.length !== 2 || room.state === "playing") return;
 
-  const category = room.pendingCategory || pickCategory();
+  const category = room.pendingCategory || pickCategory(room);
+  if (!category) return;
   room.category = category.name;
   room.categoryData = category;
   room.state = "playing";
