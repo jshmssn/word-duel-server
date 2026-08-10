@@ -2,9 +2,15 @@
   "name": "word-duel-server",
   "version": "1.0.0",
   "main": "index.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "migrate": "node scripts/migrate.js",
+    "import-words": "node scripts/importWords.js",
+    "test": "node --test"
   },
   "dependencies": {
     "cors": "^2.8.5",
