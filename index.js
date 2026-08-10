@@ -3,13 +3,77 @@ const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const wordsData = require("./words.json");
+const { createDatabase } = require("./src/database/connection");
+const { runMigrations } = require("./src/database/migrate");
+const { WORD_CHAIN_CONFIG } = require("./src/config/wordChain");
+const { SqliteWordRepository } = require("./src/repositories/SqliteWordRepository");
+const { SqliteGameRepository } = require("./src/repositories/SqliteGameRepository");
+const { WordService } = require("./src/services/WordService");
+const { PrefixService } = require("./src/services/PrefixService");
+const { GameService } = require("./src/services/GameService");
+const { GameSessionRegistry } = require("./src/services/GameSessionRegistry");
+const { createGameRouter } = require("./src/routes/gameRoutes");
+const {
+  TurnTimerManager,
+  broadcastGameState,
+  registerWordChainSocket,
+} = require("./src/socket/WordChainSocket");
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
+});
+
+// Word Chain keeps persistence and rules outside the legacy duel handlers so the
+// SQLite adapter can be replaced by a MySQL repository without changing sockets,
+// routes, or game logic.
+const wordChainDatabase = createDatabase();
+runMigrations(wordChainDatabase);
+const wordChainRepository = new SqliteWordRepository(wordChainDatabase);
+const wordChainGameRepository = new SqliteGameRepository(wordChainDatabase);
+const wordChainService = new WordService({
+  wordRepository: wordChainRepository,
+  gameRepository: wordChainGameRepository,
+  config: WORD_CHAIN_CONFIG,
+});
+const wordChainGameService = new GameService({
+  gameRepository: wordChainGameRepository,
+  wordRepository: wordChainRepository,
+  wordService: wordChainService,
+  prefixService: new PrefixService({ wordRepository: wordChainRepository }),
+  config: WORD_CHAIN_CONFIG,
+});
+const wordChainTimerManager = new TurnTimerManager({
+  gameService: wordChainGameService,
+  io,
+});
+const wordChainSessionRegistry = new GameSessionRegistry();
+// Restore server-side countdown enforcement for any game that was active when
+// this process last stopped. Expired turns resolve on the first scheduled tick.
+wordChainGameRepository.listTimedGames().forEach((game) => {
+  wordChainTimerManager.sync(wordChainGameService.publicState(game));
+});
+
+app.use(
+  "/api/game",
+  createGameRouter({
+    gameService: wordChainGameService,
+    sessionRegistry: wordChainSessionRegistry,
+    onGameChanged: (state) => {
+      broadcastGameState({ io, state });
+      wordChainTimerManager.sync(state);
+    },
+  }),
+);
+registerWordChainSocket({
+  io,
+  gameService: wordChainGameService,
+  timerManager: wordChainTimerManager,
+  sessionRegistry: wordChainSessionRegistry,
 });
 
 const rooms = {};
