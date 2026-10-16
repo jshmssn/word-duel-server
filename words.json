@@ -1,0 +1,124 @@
+{
+  "categories": [
+    {
+      "name": "Traditional Games",
+      "words": ["Patintero","Tumbang Preso","Luksong Baka","Sungka","Piko","Agawang Sulok","Chinese Garter","Taguan","Taguang Lata","Holen","Luksong Tinik","Trumpo","Turumpo","Saranggola","Pitik","Jackstone","Dampa","Batuhang Bola","Agawang Panyo","Syato"]
+    },
+    {
+      "name": "Countries",
+      "words": ["Philippines","Japan","France","Brazil","Germany","Canada","Mexico","Egypt","Spain","China","Italy","Russia","India","Korea","Sweden","Norway","Turkey","Greece","Poland","Portugal","Argentina","Australia","Denmark","Finland","Netherlands","Belgium","Austria","Switzerland","Ireland","Scotland","Nigeria","Kenya","Ghana","Morocco","Thailand","Vietnam","Malaysia","Singapore","Indonesia","Pakistan"]
+    },
+    {
+      "name": "Animals",
+      "words": ["Elephant","Dolphin","Penguin","Cheetah","Gorilla","Jaguar","Peacock","Flamingo","Ostrich","Crocodile","Leopard","Rhinoceros","Kangaroo","Platypus","Porcupine","Chameleon","Armadillo","Wolverine","Barracuda","Cassowary"]
+    },
+    {
+      "name": "Food",
+      "words": ["Adobo","Sinigang","Kare Kare","Lechon","Pancit","Lumpia","Sisig","Tinola","Bulalo","Dinuguan","Menudo","Caldereta","Humba","Bicol Express","Nilaga","Pakbet","Escabeche","Mechado","Pinakbet","Kinilaw"]
+    },
+    {
+      "name": "Sports",
+      "words": ["Basketball","Football","Swimming","Volleyball","Tennis","Baseball","Badminton","Archery","Cycling","Gymnastics","Skateboard","Wrestling","Bowling","Fencing","Softball","Taekwondo","Boxing","Rowing","Triathlon","Lacrosse"]
+    },
+    {
+      "name": "Fruits",
+      "words": ["Mango","Watermelon","Pineapple","Papaya","Guava","Lanzones","Rambutan","Durian","Jackfruit","Guyabano","Santol","Siniguelas","Atis","Balimbing","Sampalok","Bayabas","Caimito","Macopa","Pomelo","Mangosteen"]
+    },
+    {
+      "name": "Occupations",
+      "words": ["Engineer","Teacher","Architect","Scientist","Journalist","Pharmacist","Electrician","Carpenter","Veterinarian","Librarian","Historian","Economist","Psychologist","Geologist","Astronaut","Biologist","Chemist","Accountant","Radiologist","Agronomist"]
+    },
+    {
+      "name": "Nature",
+      "words": ["Waterfall","Volcano","Rainforest","Glacier","Canyon","Desert","Meadow","Swamp","Lagoon","Coral Reef","Mangrove","Savanna","Tundra","Estuary","Bayou","Plateau","Peninsula","Archipelago","Stalactite","Geysers"]
+    },
+    {
+      "name": "Philippine Names",
+      "words": ["Maria","Jose","Juan","Rosa","Pedro","Ana","Miguel","Elena","Ramon","Carmen","Eduardo","Ligaya","Rodrigo","Corazon","Ernesto","Mylene","Renato","Nimfa","Gregorio","Lourdes","Arturo","Esther","Danilo","Milagros","Edilberto","Teresita","Virgilio","Florencia","Rolando","Erlinda"]
+    },
+    {
+      "name": "Music",
+      "words": ["Guitar","Violin","Piano","Trumpet","Saxophone","Drumset","Keyboard","Ukulele","Clarinet","Trombone","Flute","Harp","Cello","Bassoon","Xylophone","Accordion","Harmonica","Banjo","Mandolin","Oboe"]
+    },
+    {
+      "name": "Actor / Actress",
+      "words": ["Sharon Cuneta","Nora Aunor","Fernando Poe","Vilma Santos","Dolphy","Maricel Soriano","Aga Muhlach","Piolo Pascual","Angel Locsin","Sarah Geronimo","Coco Martin","Kathryn Bernardo","Daniel Padilla","Alden Richards","Maine Mendoza","Marian Rivera","Dingdong Dantes","John Lloyd Cruz","Bea Alonzo","Julia Barretto"]
+    },
+    {
+      "name": "Science",
+      "words": ["Photosynthesis","Mitosis","Gravity","Electron","Nucleus","Polymer","Osmosis","Chromosome","Catalyst","Radiation","Molecule","Isotope","Magnetism","Entropy","Diffusion","Ecosystem","Thermodynamics","Quantum","Voltage","Kinetics"]
+    },
+    {
+      "name": "Math",
+      "words": ["Algebra","Calculus","Geometry","Fraction","Equation","Integer","Theorem","Polygon","Decimal","Probability","Quadratic","Statistics","Logarithm","Matrix","Vector","Binomial","Cosine","Tangent","Exponent","Parabola"]
+    },
+    {
+      "name": "Cities",
+      "words": ["Manila","Cebu","Davao","Quezon City","Makati","Pasig","Taguig","Iloilo","Bacolod","Cagayan de Oro","Zamboanga","General Santos","Antipolo","Caloocan","Valenzuela","Paranaque","Muntinlupa","Las Pinas","Marikina","Pasay"]
+    },
+    {
+      "name": "Brands",
+      "words": ["Samsung","Jollibee","McDonald","Adidas","Google","Netflix","Apple","Toyota","Honda","Nestlé","Unilever","Bench","Penshoppe","Globe","Smart","Meralco","Robinsons","Ayala","SM Mall","Lazada"]
+    },
+    {
+      "name": "Movies",
+      "words": ["Titanic","Avatar","Inception","Interstellar","Gravity","Parasite","Avengers","Frozen","Moana","Encanto","Clueless","Grease","Forrest Gump","Gladiator","Braveheart","Shawshank","Jurassic Park","Star Wars","Matrix","Jaws"]
+    },
+    {
+      "name": "TV Shows",
+      "words": ["Friends","Survivor","BigBrother","Teleserye","Pangako Sayo","Meteor Garden","Eat Bulaga","Wowowin","ASAP","GMA News","Maalaala Mo Kaya","The Voice","Pinoy Big Brother","Walking Dead","Game of Thrones","Squid Game","Stranger Things","Breaking Bad","Narcos","Money Heist"]
+    },
+    {
+      "name": "Video Games",
+      "words": ["Minecraft","Fortnite","Pokemon","Nintendo","PlayStation","Mobile Legends","Valorant","Roblox","Tetris","Pacman","Super Mario","Zelda","Overwatch","Counterstrike","Dota","Among Us","Genshin","Ragnarok","Clash of Clans","Candy Crush"]
+    },
+    {
+      "name": "Technology",
+      "words": ["Internet","Smartphone","Bluetooth","Laptop","Browser","Algorithm","Database","Software","Hardware","Keyboard","Monitor","Processor","Bandwidth","Firewall","Encryption","Router","Server","Compiler","Framework","Dashboard"]
+    },
+    {
+      "name": "Historical Figures",
+      "words": ["Rizal","Bonifacio","Aguinaldo","Mabini","Burgos","Gomez","Zamora","Lapu Lapu","Urdaneta","Silang","Tupas","Luna","Quezon","Osmena","Magsaysay","Marcos","Aquino","Laurel","Roxas","Arroyo"]
+    },
+    {
+      "name": "Landmarks",
+      "words": ["Intramuros","Rizal Park","Chocolate Hills","Banaue Rice Terraces","Mayon Volcano","Tubbataha Reef","Pagsanjan Falls","Puerto Princesa","Boracay Beach","Taal Volcano","Siargao Island","Batanes Island","Sagada Caves","Mount Pulag","Lake Sebu","Paoay Church","Miagao Church","Fort Santiago","Vigan Heritage","Coron Palawan"]
+    },
+    {
+      "name": "Mythology",
+      "words": ["Poseidon","Athena","Apollo","Artemis","Hermes","Hephaestus","Dionysus","Persephone","Medusa","Minotaur","Cyclops","Centaur","Griffon","Phoenix","Chimera","Hydra","Cerberus","Pegasus","Sphinx","Titan"]
+    },
+    {
+      "name": "Space",
+      "words": ["Galaxy","Nebula","Supernova","Asteroid","Comet","Meteor","Satellite","Telescope","Cosmos","Jupiter","Saturn","Neptune","Uranus","Mercury","Venus","Mercury","Milky Way","Black Hole","Quasar","Pulsar"]
+    },
+    {
+      "name": "Festivals",
+      "words": ["Sinulog","Ati Atihan","Pahiyas","Kadayawan","Dinagyang","Moriones","Masskara","Panagbenga","Peñafrancia","Higantes","Bocaue","Carabao Festival","Maskerade","Bamboo Festival","Irong Irong","Aliwan","Caracol","Kaamulan","Sayaw sa Bangko","Bangus Festival"]
+    },
+    {
+      "name": "Filipino Culture",
+      "words": ["Bayanihan","Mano Po","Pagmamano","Terno","Barong Tagalog","Baro at Saya","Pasalubong","Utang na Loob","Hiya","Delicadeza","Pakikisama","Sari Sari","Palengke","Parol","Noche Buena","Media Noche","Fiesta","Pamaskong Handog","Harana","Kundiman"]
+    },
+    {
+      "name": "Cartoon Characters",
+      "words": ["Spongebob","Patrick","Squidward","Sandy","Gary","Doraemon","Nobita","Shizuka","Gian","Suneo","Dexter","Mandark","Powerpuff Girls","Blossom","Bubbles","Buttercup","Scooby Doo","Shaggy","Velma","Daphne"]
+    },
+    {
+      "name": "Superheroes",
+      "words": ["Superman","Batman","Spiderman","Ironman","Captain America","Black Panther","Thor","Wonder Woman","Aquaman","Green Lantern","Hulk","Flash","Doctor Strange","Ant Man","Hawkeye","Wolverine","Storm","Cyclops","Professor X","Black Widow"]
+    },
+    {
+      "name": "Body Parts",
+      "words": ["Forehead","Eyebrow","Eyelid","Nostril","Earlobe","Tonsils","Larynx","Trachea","Diaphragm","Sternum","Scapula","Humerus","Femur","Patella","Tibia","Fibula","Phalanges","Clavicle","Mandible","Pancreas"]
+    },
+    {
+      "name": "Vehicles",
+      "words": ["Bicycle","Tricycle","Jeepney","Pedicab","Motorcycle","Ambulance","Firetruck","Helicopter","Submarine","Bulldozer","Excavator","Forklift","Gondola","Sailboat","Speedboat","Scooter","Skateboard","Monorail","Hovercraft","Airship"]
+    },
+    {
+      "name": "Plants",
+      "words": ["Sunflower","Bamboo","Cactus","Orchid","Sampaguita","Ylang Ylang","Makahiya","Narra","Molave","Mahogany","Banaba","Pandan","Tanglad","Kamote","Kamatis","Talong","Patola","Ampalaya","Sitaw","Kangkong"]
+    }
+  ]
+}
