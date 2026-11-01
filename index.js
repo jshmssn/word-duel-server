@@ -1,7 +1,10 @@
+function lobbyPlayerId(socket) { return socket.data?.playerId || socket.id; }
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const { randomUUID } = require("node:crypto");
+const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS) || 90_000;
 const wordsData = require("./words.json");
 const { roomOptions } = require("./src/config/gameModes");
 const { ColorCardRounds } = require("./src/socket/ColorCardSocket");
@@ -92,6 +95,7 @@ function lobbyState(room) {
     turnDuration: room.turnDuration, roundLimit: room.roundLimit,
     colorDuration: room.colorDuration,
     colorCardCount: room.colorCardCount,
+    pausedAt: room.pausedAt || null,
   };
 }
 
@@ -288,19 +292,26 @@ function publicPlayers(room) {
     ready: p.ready,
     wins: p.wins || 0,
     isBot: Boolean(p.isBot),
+    connected: p.connected !== false,
+    ...(room.gameMode === "color-card" && room.state === "waiting" ? {
+      previousMatchAverageAccuracy: p.previousMatchAverageAccuracy || 0,
+      previousMatchCardCount: p.previousMatchCardCount || 0,
+      previousMatchId: p.previousMatchId || null,
+    } : {}),
   }));
 }
 
-function broadcastReadyState(code) {
+function broadcastReadyState(code, changedPlayerId) {
   const room = rooms[code];
   if (!room) return;
   io.to(code).emit("ready-update", {
     ...lobbyState(room),
+    ...(changedPlayerId ? { changedPlayerId } : {}),
   });
 }
 
 function roomReadyToStart(room) {
-  return room.players.length >= 2 && room.players.length <= room.maxPlayers && room.players.every((p) => p.ready);
+  return !room.pausedAt && room.players.length >= 2 && room.players.length <= room.maxPlayers && room.players.every((p) => p.ready && p.connected !== false);
 }
 
 // ─── Countdown logic ─────────────────────────────────────────────────────────
@@ -343,19 +354,21 @@ function clearCountdown(code) {
 
 // ─── Turn Timer ───────────────────────────────────────────────────────────────
 
-function startTurnTimer(code) {
+function startTurnTimer(code, resumeRemaining) {
   const room = rooms[code];
-  if (!room || !room.turnDuration) return;
+  if (!room || !room.turnDuration || room.pausedAt) return;
   const currentPlayer = room.players.find((p) => p.id === room.currentTurn);
   if (isBotPlayer(currentPlayer)) return;
   clearTurnTimer(code);
 
-  let remaining = room.turnDuration;
+  let remaining = resumeRemaining ?? room.turnDuration;
+  room.turnRemaining = remaining;
   io.to(code).emit("timer-update", { remaining, total: room.turnDuration });
 
   room.turnTimerInterval = setInterval(() => {
     if (!rooms[code]) { clearInterval(room.turnTimerInterval); return; }
     remaining--;
+    room.turnRemaining = remaining;
     io.to(code).emit("timer-update", { remaining, total: room.turnDuration });
     if (remaining <= 0) {
       clearTurnTimer(code);
@@ -433,12 +446,186 @@ function createRoomState(code, creatorId, username, { withBot = false, gameMode 
     botGuesses: {},
     pendingLetterAsk: null,
     pendingLetterCount: null,
+    pausedAt: null,
+    askedLetters: {},
   };
 }
 
+function attachRoomSession(socket, room, player) {
+  socket.data.playerId = player.id;
+  socket.data.lobbyCode = room.code;
+  socket.join(room.code);
+  socket.join(player.id);
+  player.socketId = socket.id;
+  player.connected = true;
+  player.sessionToken ||= randomUUID();
+  clearTimeout(player.reconnectTimer);
+  player.reconnectTimer = null;
+  socket.emit("room-session", { code: room.code, playerId: player.id, token: player.sessionToken });
+}
+
+function personalRoomState(room, playerId) {
+  let state = {};
+  if (room.gameMode === "color-card" && room.colorRound) state = colorCardRounds.snapshot(room, playerId);
+  else if (room.state === "playing") {
+    const opponent = getOpponent(room, playerId);
+    const prompt = (pending) => pending && getOpponent(room, pending.askerId)?.id === playerId
+      ? { askerName: room.players.find((player) => player.id === pending.askerId)?.username, letter: pending.letter } : null;
+    state.gameState = {
+      ...lobbyState(room), category: room.category, opponentId: opponent?.id,
+      myWord: room.words[playerId], myWordLetterCount: getLetterCount(room.words[playerId]),
+      opponentLetterCount: getLetterCount(room.words[opponent?.id]), currentTurn: room.currentTurn,
+      confirmedLetters: getExpandedConfirmedLetters(room, playerId), askedLetters: room.askedLetters?.[playerId] || {},
+      timerRemaining: room.turnRemaining ?? room.turnDuration,
+      letterAskPrompt: prompt(room.pendingLetterAsk), letterCountPrompt: prompt(room.pendingLetterCount),
+      waitingFor: [room.pendingLetterAsk, room.pendingLetterCount].find((pending) => pending?.askerId === playerId) || null,
+    };
+  } else if (room.state === "ended") state.result = room.lastResult;
+  return {
+    ...lobbyState(room), ...state, playerId, serverNow: Date.now(),
+    screen: state.gameState ? "game" : state.result ? "gameover" : "waiting",
+    chatMessages: room.chatHistory,
+    pendingCategory: room.state === "slotting" ? room.category : null,
+  };
+}
+
+function sendRoomSnapshots(room) {
+  getHumanPlayers(room).filter((player) => player.connected !== false).forEach((player) => {
+    io.to(player.id).emit("room-restored", personalRoomState(room, player.id));
+  });
+}
+
+function pauseRoom(room, player) {
+  if (!room.pausedAt) {
+    room.pausedAt = Date.now();
+    clearCountdown(room.code);
+    clearTurnTimer(room.code);
+    clearBotTimer(room.code);
+    colorCardRounds.clear(room.code);
+  }
+  io.to(room.code).emit("ROOM_PAUSED", {
+    code: room.code, players: publicPlayers(room), pausedAt: room.pausedAt,
+    serverNow: Date.now(), expiresAt: player.reconnectExpiresAt,
+    message: `${player.username} is reconnecting. The room and timers are paused.`,
+  });
+}
+
+function resumeRoom(room) {
+  if (!room.pausedAt || room.players.some((player) => player.connected === false)) return;
+  const duration = Date.now() - room.pausedAt;
+  room.pausedAt = null;
+  if (room.gameMode === "color-card" && room.colorRound) colorCardRounds.resume(room, duration);
+  else if (room.state === "playing") {
+    if (!room.pendingLetterAsk && !room.pendingLetterCount) {
+      startTurnTimer(room.code, room.turnRemaining);
+      scheduleBotTurnIfNeeded(room.code);
+    }
+  } else if (room.state === "waiting" && roomReadyToStart(room)) startCountdown(room.code);
+  io.to(room.code).emit("ROOM_RESUMED", { code: room.code, players: publicPlayers(room), message: "Everyone is back. The room has resumed!" });
+  sendRoomSnapshots(room);
+  if (room.state === "slotting") io.to(room.code).emit("category-selected", { category: room.category, selectedCategoryName: room.category });
+}
+
+function reserveSeat(room, player, socket, disconnected = false) {
+  if (disconnected) colorCardRounds.resetPreviousMatch(room);
+  if (player.reconnectTimer) {
+    if (disconnected) pauseRoom(room, player);
+    return;
+  }
+  player.connected = false;
+  player.reconnectExpiresAt = Date.now() + RECONNECT_GRACE_MS;
+  pauseRoom(room, player);
+  player.reconnectTimer = setTimeout(() => {
+    if (rooms[room.code] === room && player.connected === false) {
+      // An app may remain connected while backgrounded; release that seat too.
+      leaveRoom(socket, true);
+    }
+  }, RECONNECT_GRACE_MS);
+  player.reconnectTimer.unref();
+}
+
+// Explicit quits and expired reconnection reservations release room resources.
+function leaveRoom(socket, disconnected = false) {
+  const code = socket.data.lobbyCode;
+  const room = rooms[code];
+  const index = room?.players.findIndex((player) => player.id === lobbyPlayerId(socket)) ?? -1;
+  if (index < 0) {
+    socket.data.lobbyCode = null;
+    return;
+  }
+  const [left] = room.players.splice(index, 1);
+  colorCardRounds.resetPreviousMatch(room);
+  clearTimeout(left.reconnectTimer);
+  const cancelled = !["waiting", "ended"].includes(room.state);
+  socket.leave(code);
+  socket.data.lobbyCode = null;
+  clearCountdown(code);
+  clearTurnTimer(code);
+  clearBotTimer(code);
+  colorCardRounds.clear(code);
+  room.colorRound = null;
+  room.colorMatch = null;
+  room.colorRanking = null;
+  room.pendingLetterAsk = null;
+  room.pendingLetterCount = null;
+  room.currentTurn = null;
+  room.words = {};
+  room.confirmedLetters = {};
+  room.pendingCategory = null;
+  room.slotDoneIds = null;
+  if (!room.players.some((player) => player.connected === false)) room.pausedAt = null;
+
+  const text = `${left.username} ${disconnected ? "disconnected" : "quit the room"}.${cancelled ? " The round was cancelled; ready up to play again." : ""}`;
+  const message = { id: Date.now() + Math.random(), system: true, text, timestamp: Date.now() };
+  room.chatHistory.push(message);
+  room.chatHistory = room.chatHistory.slice(-100);
+  io.to(code).emit("chat-message", message);
+  io.to(code).emit("player-left", { code, playerId: left.id, username: left.username, disconnected, message: text });
+  if (!getHumanPlayers(room).length) {
+    delete rooms[code];
+    return;
+  }
+  room.state = "waiting";
+  if (room.creatorId === left.id) room.creatorId = getHumanPlayers(room)[0].id;
+  room.players.forEach((player) => { player.ready = isBotPlayer(player); });
+  broadcastReadyState(code);
+  io.to(code).emit("rematch-lobby", { ...lobbyState(room), message: text, departure: true });
+}
+
 io.on("connection", (socket) => {
-  console.log(`[+] Connected: ${socket.id}`);
+  console.log(`[+] Connected: ${lobbyPlayerId(socket)}`);
   colorCardRounds.register(socket);
+  socket.use(([event, , reply], next) => {
+    const room = rooms[socket.data.lobbyCode];
+    if (room?.pausedAt && !["resume-room", "suspend-room", "leave-room", "chat-message"].includes(event)) {
+      const response = { success: false, message: "The room is paused while a player reconnects." };
+      if (typeof reply === "function") reply(response);
+      else socket.emit("room-action-error", response);
+      return;
+    }
+    next();
+  });
+
+  socket.on("suspend-room", (payload = {}) => {
+    const room = rooms[socket.data.lobbyCode];
+    const player = room?.players.find((candidate) => candidate.id === lobbyPlayerId(socket));
+    if (room && player && payload.code === room.code) reserveSeat(room, player, socket);
+  });
+
+  socket.on("resume-room", (payload = {}, reply) => {
+    try {
+      const room = rooms[payload?.code];
+      const player = room?.players.find((candidate) => candidate.sessionToken && candidate.sessionToken === payload?.token);
+      if (!player || (player.connected === false && Date.now() >= player.reconnectExpiresAt)) throw new Error("Your room reservation expired. Join a room to play again.");
+      if (socket.data.lobbyCode && socket.data.lobbyCode !== room.code) throw new Error("You are already in another room.");
+      const previousSocket = io.sockets.sockets.get(player.socketId);
+      attachRoomSession(socket, room, player);
+      if (previousSocket && previousSocket !== socket) previousSocket.disconnect(true);
+      if (room.pausedAt && !room.players.some((candidate) => candidate.connected === false)) resumeRoom(room);
+      else socket.emit("room-restored", personalRoomState(room, player.id));
+      if (typeof reply === "function") reply({ success: true });
+    } catch (error) { if (typeof reply === "function") reply({ success: false, message: error.message }); }
+  });
 
   // ── Create Room ──
   const createRoom = (payload = {}, reply) => {
@@ -450,10 +637,9 @@ io.on("connection", (socket) => {
       let code;
       do { code = generateRoomCode(); } while (rooms[code]);
 
-      rooms[code] = createRoomState(code, socket.id, name, settings);
+      rooms[code] = createRoomState(code, lobbyPlayerId(socket), name, settings);
 
-      socket.join(code);
-      socket.data.lobbyCode = code;
+      attachRoomSession(socket, rooms[code], rooms[code].players[0]);
       const state = lobbyState(rooms[code]);
       socket.emit("room-created", state);
       if (typeof reply === "function") reply({ success: true, ...state });
@@ -475,10 +661,9 @@ io.on("connection", (socket) => {
     let code;
     do { code = generateRoomCode(); } while (rooms[code]);
 
-    rooms[code] = createRoomState(code, socket.id, username, { withBot: true });
+    rooms[code] = createRoomState(code, lobbyPlayerId(socket), username, { withBot: true });
 
-    socket.join(code);
-    socket.data.lobbyCode = code;
+    attachRoomSession(socket, rooms[code], rooms[code].players[0]);
     socket.emit("room-created", lobbyState(rooms[code]));
     console.log(`[Bot Room] ${code} created by ${username}`);
   });
@@ -496,15 +681,14 @@ io.on("connection", (socket) => {
     if (room.players.length >= room.maxPlayers) { socket.emit("join-error", { message: "Room is full." }); return; }
     if (room.state !== "waiting") { socket.emit("join-error", { message: "Game already in progress." }); return; }
 
-    room.players.push({ id: socket.id, username, ready: false, wins: 0 });
-    socket.join(code);
-    socket.data.lobbyCode = code;
+    room.players.push({ id: lobbyPlayerId(socket), username, ready: false, wins: 0 });
+    attachRoomSession(socket, room, room.players.at(-1));
     clearCountdown(code);
 
     socket.emit("chat-history", { messages: room.chatHistory });
 
     const joinedState = lobbyState(room);
-    io.to(code).emit("player-joined", joinedState);
+    io.to(code).emit("player-joined", { ...joinedState, joinedPlayerId: lobbyPlayerId(socket) });
     // Explicit acknowledgement prevents the joining client from showing a room
     // that rejected its code (e.g. a full room or a game already in progress).
     socket.emit("room-joined", joinedState);
@@ -517,7 +701,7 @@ io.on("connection", (socket) => {
   socket.on("START_GAME", (payload, reply) => {
     const { code } = payload || {};
     const room = rooms[code];
-    if (!room || room.creatorId !== socket.id || room.state !== "waiting" || !roomReadyToStart(room)) {
+    if (!room || room.creatorId !== lobbyPlayerId(socket) || room.state !== "waiting" || !roomReadyToStart(room)) {
       if (typeof reply === "function") reply({ success: false, message: "Only the host can start once all players are ready." });
       return;
     }
@@ -529,7 +713,7 @@ io.on("connection", (socket) => {
   // ── Set Turn Timer ──
   socket.on("set-turn-duration", ({ code, turnDuration }) => {
     const room = rooms[code];
-    if (!room || room.gameMode !== "word-duel" || room.state !== "waiting" || room.creatorId !== socket.id) return;
+    if (!room || room.gameMode !== "word-duel" || room.state !== "waiting" || room.creatorId !== lobbyPlayerId(socket)) return;
 
     room.turnDuration = sanitizeTurnDuration(turnDuration);
     io.to(code).emit("turn-duration-update", {
@@ -540,7 +724,7 @@ io.on("connection", (socket) => {
 
   socket.on("set-round-limit", ({ code, roundLimit }) => {
     const room = rooms[code];
-    if (!room || room.gameMode !== "word-duel" || room.state !== "waiting" || room.creatorId !== socket.id) return;
+    if (!room || room.gameMode !== "word-duel" || room.state !== "waiting" || room.creatorId !== lobbyPlayerId(socket)) return;
 
     room.roundLimit = sanitizeRoundLimit(roundLimit);
     io.to(code).emit("round-limit-update", {
@@ -553,10 +737,10 @@ io.on("connection", (socket) => {
   socket.on("toggle-ready", ({ code }) => {
     const room = rooms[code];
     if (!room || room.state !== "waiting") return;
-    const player = room.players.find((p) => p.id === socket.id);
+    const player = room.players.find((p) => p.id === lobbyPlayerId(socket));
     if (!player) return;
     player.ready = !player.ready;
-    broadcastReadyState(code);
+    broadcastReadyState(code, lobbyPlayerId(socket));
     const allReady = roomReadyToStart(room);
     if (allReady) startCountdown(code);
     else clearCountdown(code);
@@ -565,10 +749,10 @@ io.on("connection", (socket) => {
   socket.on("slot-machine-done", ({ code }) => {
     const room = rooms[code];
     if (!room || room.state !== "slotting" || !room.pendingCategory) return;
-    if (!room.players.some((p) => p.id === socket.id)) return;
+    if (!room.players.some((p) => p.id === lobbyPlayerId(socket))) return;
 
     if (!(room.slotDoneIds instanceof Set)) room.slotDoneIds = new Set();
-    room.slotDoneIds.add(socket.id);
+    room.slotDoneIds.add(lobbyPlayerId(socket));
 
     const allDone =
       room.players.length >= 2 &&
@@ -581,13 +765,13 @@ io.on("connection", (socket) => {
   socket.on("chat-message", ({ code, text }) => {
     const room = rooms[code];
     if (!room) return;
-    const player = room.players.find((p) => p.id === socket.id);
+    const player = room.players.find((p) => p.id === lobbyPlayerId(socket));
     if (!player) return;
     const trimmed = text?.trim();
     if (!trimmed || trimmed.length > 200) return;
     const msg = {
       id: Date.now() + Math.random(),
-      playerId: socket.id,
+      playerId: lobbyPlayerId(socket),
       username: player.username,
       text: trimmed,
       timestamp: Date.now(),
@@ -601,15 +785,15 @@ io.on("connection", (socket) => {
   socket.on("ask-letter", ({ code, letter }) => {
     const room = rooms[code];
     if (!room || room.gameMode !== "word-duel" || room.state !== "playing") return;
-    if (room.currentTurn !== socket.id) { socket.emit("not-your-turn"); return; }
+    if (room.currentTurn !== lobbyPlayerId(socket)) { socket.emit("not-your-turn"); return; }
     if (room.pendingLetterAsk) { socket.emit("action-pending"); return; }
 
     letter = letter.toUpperCase();
-    const opponent = getOpponent(room, socket.id);
+    const opponent = getOpponent(room, lobbyPlayerId(socket));
     if (!opponent) return;
 
     // Store pending ask
-    room.pendingLetterAsk = { askerId: socket.id, letter };
+    room.pendingLetterAsk = { askerId: lobbyPlayerId(socket), letter };
     clearTurnTimer(code);
 
     // Notify asker that we're waiting
@@ -623,28 +807,28 @@ io.on("connection", (socket) => {
 
     // Prompt opponent
     io.to(opponent.id).emit("letter-ask-prompt", {
-      askerName: room.players.find((p) => p.id === socket.id).username,
+      askerName: room.players.find((p) => p.id === lobbyPlayerId(socket)).username,
       letter,
     });
   });
 
   // ── Answer Letter Ask ── (opponent responds Yes/No)
   socket.on("answer-letter-ask", ({ code, answer }) => {
-    answerPendingLetterAsk(code, socket.id, answer);
+    answerPendingLetterAsk(code, lobbyPlayerId(socket), answer);
   });
 
   // ── Ask Letter Count ──
   socket.on("ask-letter-count", ({ code, letter }) => {
     const room = rooms[code];
     if (!room || room.gameMode !== "word-duel" || room.state !== "playing") return;
-    if (room.currentTurn !== socket.id) { socket.emit("not-your-turn"); return; }
+    if (room.currentTurn !== lobbyPlayerId(socket)) { socket.emit("not-your-turn"); return; }
     if (room.pendingLetterCount) { socket.emit("action-pending"); return; }
 
     letter = letter.toUpperCase();
-    const opponent = getOpponent(room, socket.id);
+    const opponent = getOpponent(room, lobbyPlayerId(socket));
     if (!opponent) return;
 
-    room.pendingLetterCount = { askerId: socket.id, letter };
+    room.pendingLetterCount = { askerId: lobbyPlayerId(socket), letter };
     clearTurnTimer(code);
 
     socket.emit("waiting-for-response", { action: "letter-count", letter });
@@ -656,28 +840,28 @@ io.on("connection", (socket) => {
     }
 
     io.to(opponent.id).emit("letter-count-prompt", {
-      askerName: room.players.find((p) => p.id === socket.id).username,
+      askerName: room.players.find((p) => p.id === lobbyPlayerId(socket)).username,
       letter,
     });
   });
 
   // ── Answer Letter Count ──
   socket.on("answer-letter-count", ({ code, count }) => {
-    answerPendingLetterCount(code, socket.id, count);
+    answerPendingLetterCount(code, lobbyPlayerId(socket), count);
   });
 
   // ── Guess Word ──
   socket.on("guess-word", ({ code, guess }) => {
     const room = rooms[code];
     if (!room || room.gameMode !== "word-duel" || room.state !== "playing") return;
-    if (room.currentTurn !== socket.id) { socket.emit("not-your-turn"); return; }
-    finishGuess(code, socket.id, guess);
+    if (room.currentTurn !== lobbyPlayerId(socket)) { socket.emit("not-your-turn"); return; }
+    finishGuess(code, lobbyPlayerId(socket), guess);
   });
 
   // ── Rematch ──
   socket.on("rematch", ({ code }) => {
     const room = rooms[code];
-    if (!room || room.state !== "ended" || !room.players.some((p) => p.id === socket.id)) return;
+    if (!room || room.state !== "ended" || !room.players.some((p) => p.id === lobbyPlayerId(socket))) return;
     if (room.gameMode === "color-card" && room.colorMatch?.history.length < room.colorMatch?.targets.length) return;
     if (room.seriesOver && room.roundLimit > 1) {
       room.players.forEach((p) => (p.wins = 0));
@@ -697,42 +881,23 @@ io.on("connection", (socket) => {
     io.to(code).emit("rematch-lobby", lobbyState(room));
   });
 
-  // ── Disconnect ──
-  socket.on("disconnect", () => {
-    console.log(`[-] Disconnected: ${socket.id}`);
-    for (const code in rooms) {
-      const room = rooms[code];
-      const idx = room.players.findIndex((p) => p.id === socket.id);
-      if (idx !== -1) {
-        const left = room.players[idx];
-        clearCountdown(code);
-        clearTurnTimer(code);
-        clearBotTimer(code);
-        colorCardRounds.clear(code);
-        room.colorRound = null;
-        room.colorMatch = null;
-        room.colorRanking = null;
-        room.players.splice(idx, 1);
-        io.to(code).emit("player-left", { playerId: left.id, username: left.username, disconnected: true });
-        if (room.players.length === 0 || room.players.every((p) => isBotPlayer(p))) {
-          delete rooms[code];
-          console.log(`[Room] ${code} deleted`);
-        } else {
-          room.state = "waiting";
-          room.pendingCategory = null;
-          room.slotDoneIds = null;
-          if (!room.players.some((p) => p.id === room.creatorId)) {
-            room.creatorId = room.players[0].id;
-          }
-          room.players.forEach((p) => (p.ready = isBotPlayer(p)));
-          broadcastReadyState(code);
-          if (room.gameMode === "color-card") {
-            io.to(code).emit("rematch-lobby", { ...lobbyState(room), message: "A player disconnected. The round was cancelled; ready up to play again." });
-          }
-        }
-        break;
-      }
+  socket.on("leave-room", (payload = {}, reply) => {
+    if (payload?.code !== socket.data.lobbyCode || !rooms[payload?.code]?.players.some((player) => player.id === lobbyPlayerId(socket))) {
+      if (typeof reply === "function") reply({ success: false, message: "You are not in this room." });
+      return;
     }
+    leaveRoom(socket);
+    if (typeof reply === "function") reply({ success: true });
+  });
+
+  // ── Disconnect ──
+  socket.on("disconnect", (reason) => {
+    console.log(`[-] Disconnected: ${lobbyPlayerId(socket)}`);
+    const room = rooms[socket.data.lobbyCode];
+    const player = room?.players.find((candidate) => candidate.id === lobbyPlayerId(socket));
+    if (!player || player.socketId !== socket.id) return;
+    if (["client namespace disconnect", "server namespace disconnect", "server shutting down"].includes(reason)) { leaveRoom(socket, true); return; }
+    reserveSeat(room, player, socket, true);
   });
 });
 
@@ -789,6 +954,8 @@ function answerPendingLetterAsk(code, responderId, answer) {
     const counts = getConfirmedLetterCounts(room, askerId);
     setConfirmedLetterCount(room, askerId, letter, Math.max(counts[letter] || 0, 1));
   }
+  room.askedLetters[askerId] ||= {};
+  room.askedLetters[askerId][letter] = hasLetter ? "yes" : "no";
 
   io.to(code).emit("letter-result", {
     askerId,
@@ -814,6 +981,8 @@ function answerPendingLetterCount(code, responderId, count) {
   if (!asker || !responder || isNaN(numCount) || numCount < 0) return;
 
   room.pendingLetterCount = null;
+  room.askedLetters[askerId] ||= {};
+  room.askedLetters[askerId][letter] = numCount > 0 ? "yes" : "no";
   setConfirmedLetterCount(room, askerId, letter, numCount);
 
   io.to(code).emit("letter-count-result", {
@@ -869,7 +1038,7 @@ function finishGuess(code, guesserId, guess) {
     const seriesState = getSeriesState(room, guesserId);
     room.seriesOver = seriesState.seriesOver;
 
-    io.to(code).emit("game-over", {
+    room.lastResult = {
       winnerId: guesserId,
       winnerName: guesser.username,
       winnerWins: guesser.wins,
@@ -879,7 +1048,8 @@ function finishGuess(code, guesserId, guess) {
       wordsByPlayer: room.words,
       opponentsByPlayer: Object.fromEntries(room.players.map((player) => [player.id, getOpponent(room, player.id).id])),
       ...seriesState,
-    });
+    };
+    io.to(code).emit("game-over", room.lastResult);
     return;
   }
 
@@ -935,7 +1105,7 @@ function chooseBotLetter(room, botId, targetId, candidates) {
 
 function scheduleBotTurnIfNeeded(code) {
   const room = rooms[code];
-  if (!room || room.state !== "playing") return;
+  if (!room || room.state !== "playing" || room.pausedAt) return;
   clearBotTimer(code);
 
   const bot = room.players.find((p) => p.id === room.currentTurn && isBotPlayer(p));
@@ -946,7 +1116,7 @@ function scheduleBotTurnIfNeeded(code) {
 
 function runBotTurn(code) {
   const room = rooms[code];
-  if (!room || room.state !== "playing") return;
+  if (!room || room.state !== "playing" || room.pausedAt) return;
   const bot = room.players.find((p) => p.id === room.currentTurn && isBotPlayer(p));
   if (!bot || room.pendingLetterAsk || room.pendingLetterCount) return;
 
@@ -1012,6 +1182,7 @@ function startGame(code) {
   room.slotDoneIds = null;
   room.words = {};
   room.confirmedLetters = {};
+  room.askedLetters = {};
   room.guessAttempts = {};
   room.botAskedLetters = {};
   room.botCountAskedLetters = {};

@@ -55,6 +55,7 @@ class ColorCardGame {
       durationSeconds: duration,
       players: players.map(({ id, username }) => ({ id, username })),
       submissions: new Map(),
+      submittedAt: new Map(),
       drafts: new Map(players.map((player) => [player.id, "#FFFFFF"])),
       autoSubmittedIds: new Set(),
       result: null,
@@ -119,6 +120,7 @@ class ColorCardGame {
     const color = normalizeHex(hex);
     round.drafts.set(playerId, color);
     round.submissions.set(playerId, color);
+    round.submittedAt.set(playerId, this.now());
     return color;
   }
 
@@ -126,13 +128,14 @@ class ColorCardGame {
     this.requirePicking(round, playerId, roundId);
     const color = normalizeHex(hex);
     round.drafts.set(playerId, color);
-    if (round.submissions.get(playerId) !== color) round.submissions.delete(playerId);
+    if (round.submissions.get(playerId) !== color) { round.submissions.delete(playerId); round.submittedAt.delete(playerId); }
     return color;
   }
 
   edit(round, { playerId, roundId }) {
     this.requirePicking(round, playerId, roundId);
     round.submissions.delete(playerId);
+    round.submittedAt.delete(playerId);
     return round.drafts.get(playerId);
   }
 
@@ -142,6 +145,7 @@ class ColorCardGame {
       round.players.forEach((player) => {
         if (!round.submissions.has(player.id)) {
           round.autoSubmittedIds.add(player.id);
+          round.submittedAt.set(player.id, round.endsAt);
         }
         round.submissions.set(player.id, round.drafts.get(player.id) || "#FFFFFF");
       });
@@ -151,6 +155,7 @@ class ColorCardGame {
       const distance = submittedColor === null ? null : colorDistance(round.targetColor, submittedColor);
       return {
         ...player, submittedColor, distance, autoSubmitted: round.autoSubmittedIds.has(player.id),
+        timeConsumedMs: round.submittedAt.has(player.id) ? Math.max(0, round.submittedAt.get(player.id) - round.memorizeEndsAt) : null,
         accuracy: distance === null ? null : Math.max(0, (1 - distance / MAX_RGB_DISTANCE) * 100),
       };
     }).sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));

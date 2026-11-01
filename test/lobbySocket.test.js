@@ -23,6 +23,7 @@ function next(socket, event, timeout = 4000) {
 
 async function connect(t) {
   const socket = client(url, { transports: ["websocket"], forceNew: true, reconnection: false });
+  socket.on("room-session", (session) => { socket.session = session; });
   t.after(() => socket.disconnect());
   await next(socket, "connect");
   return socket;
@@ -52,7 +53,7 @@ async function ready(room) {
   for (const socket of room.sockets) {
     const updated = next(room.host, "ready-update");
     socket.emit("toggle-ready", { code: room.code });
-    await updated;
+    assert.equal((await updated).changedPlayerId, socket.session?.playerId || socket.id);
   }
 }
 
@@ -79,6 +80,70 @@ test("room creation validates modes and limits; defaults retain Word Duel", asyn
   assert.equal(state.maxPlayers, 2);
 });
 
+test("Color Card previous-match averages survive rematches, then reset after a disconnect or quit", { timeout: 25000 }, async (t) => {
+  const host = await connect(t);
+  const sessionPromise = next(host, "room-session");
+  const created = next(host, "room-created");
+  host.emit("CREATE_ROOM", { username: "Host", gameMode: "color-card", colorCardCount: 1 });
+  const state = await created;
+  const session = await sessionPromise;
+  assert.equal(state.players[0].previousMatchAverageAccuracy, 0);
+  assert.equal(state.players[0].previousMatchCardCount, 0);
+  const guest = await connect(t);
+  const joined = next(guest, "room-joined");
+  guest.emit("join-room", { code: state.code, username: "Guest" }); await joined;
+  const room = { ...state, host, sockets: [host, guest] };
+  const round = await startColor(room);
+  const poll = next(host, "COLOR_SKIP_VOTE");
+  for (const socket of room.sockets) await ack(socket, "SUBMIT_COLOR", { code: room.code, roundId: round.roundId, hex: round.targetColor });
+  const vote = (await poll).vote;
+  const review = next(host, "ROUND_RESULTS");
+  const ranking = next(host, "COLOR_RANKINGS", 7000);
+  for (const socket of room.sockets) await ack(socket, "VOTE_COLOR_SKIP", { code: room.code, roundId: round.roundId, voteId: vote.id, choice: "yes" });
+  assert.ok((await review).players.every((player) => player.previousMatchAverageAccuracy === undefined));
+  await ranking;
+  const lobby = next(host, "rematch-lobby");
+  host.emit("rematch", { code: room.code });
+  for (const player of (await lobby).players) {
+    assert.equal(player.previousMatchAverageAccuracy, 100);
+    assert.equal(player.previousMatchCardCount, 1);
+  }
+  const restored = next(host, "room-restored");
+  assert.equal((await ack(host, "resume-room", session)).success, true);
+  assert.ok((await restored).players.every((player) => player.previousMatchAverageAccuracy === 100));
+  const backgrounded = next(guest, "ROOM_PAUSED");
+  host.emit("suspend-room", { code: room.code });
+  assert.ok((await backgrounded).players.every((player) => player.previousMatchAverageAccuracy === 100));
+  const foregrounded = next(host, "room-restored");
+  await ack(host, "resume-room", session);
+  assert.ok((await foregrounded).players.every((player) => player.previousMatchAverageAccuracy === 100));
+  const paused = next(guest, "ROOM_PAUSED");
+  host.io.engine.close();
+  assert.ok((await paused).players.every((player) => player.previousMatchAverageAccuracy === 0 && player.previousMatchCardCount === 0));
+  const recovered = await connect(t);
+  const recoveredState = next(recovered, "room-restored");
+  assert.equal((await ack(recovered, "resume-room", session)).success, true);
+  assert.ok((await recoveredState).players.every((player) => player.previousMatchAverageAccuracy === 0));
+
+  const newRoom = { ...room, host: recovered, sockets: [recovered, guest] };
+  const newRound = await startColor(newRoom);
+  const newPoll = next(recovered, "COLOR_SKIP_VOTE");
+  for (const socket of newRoom.sockets) await ack(socket, "SUBMIT_COLOR", { code: room.code, roundId: newRound.roundId, hex: newRound.targetColor });
+  const newVote = (await newPoll).vote;
+  const newRanking = next(recovered, "COLOR_RANKINGS", 7000);
+  for (const socket of newRoom.sockets) await ack(socket, "VOTE_COLOR_SKIP", { code: room.code, roundId: newRound.roundId, voteId: newVote.id, choice: "yes" });
+  await newRanking;
+  const newLobby = next(recovered, "rematch-lobby");
+  recovered.emit("rematch", { code: room.code });
+  assert.ok((await newLobby).players.every((player) => player.previousMatchAverageAccuracy === 100));
+  const departure = next(recovered, "rematch-lobby");
+  assert.equal((await ack(guest, "leave-room", { code: room.code })).success, true);
+  const remaining = (await departure).players;
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].previousMatchAverageAccuracy, 0);
+  assert.equal(remaining[0].previousMatchCardCount, 0);
+});
+
 test("the server rejects excess and duplicate players in both modes", async (t) => {
   for (const mode of ["word-duel", "color-card"]) {
     const room = await makeRoom(t, 3, mode, 3);
@@ -90,6 +155,74 @@ test("the server rejects excess and duplicate players in both modes", async (t) 
     room.host.emit("JOIN_ROOM", { code: room.code, username: "Again" });
     assert.match((await duplicate).message, /already in a room/);
   }
+});
+
+for (const mode of ["word-duel", "color-card"]) {
+  for (const phase of ["waiting", "playing"]) {
+    test(`${mode}: quitting ${phase} notifies everyone, transfers the host, and releases membership`, async (t) => {
+      const room = await makeRoom(t, 3, mode);
+      if (phase === "playing") {
+        await ready(room);
+        const started = next(room.host, mode === "word-duel" ? "category-selected" : "START_GAME");
+        assert.equal((await ack(room.host, "START_GAME", { code: room.code })).success, true);
+        await started;
+        if (mode === "word-duel") {
+          const game = next(room.host, "game-start");
+          room.sockets.forEach((socket) => socket.emit("slot-machine-done", { code: room.code }));
+          await game;
+        }
+      }
+      const guests = room.sockets.slice(1);
+      const notices = guests.map((socket) => next(socket, "player-left"));
+      const chats = guests.map((socket) => next(socket, "chat-message"));
+      const lobbies = guests.map((socket) => next(socket, "rematch-lobby"));
+      const hostId = room.host.id;
+      assert.equal((await ack(room.host, "leave-room", { code: room.code })).success, true);
+      assert.equal(room.host.connected, true);
+      for (const notice of await Promise.all(notices)) {
+        assert.equal(notice.playerId, hostId);
+        assert.equal(notice.disconnected, false);
+        assert.match(notice.message, /Host quit the room/);
+      }
+      for (const chat of await Promise.all(chats)) {
+        assert.equal(chat.system, true);
+        assert.match(chat.text, /Host quit the room/);
+      }
+      for (const lobby of await Promise.all(lobbies)) {
+        assert.equal(lobby.creatorId, guests[0].id);
+        assert.equal(lobby.players.length, 2);
+        assert.ok(lobby.players.every((player) => !player.ready));
+        assert.equal(lobby.departure, true);
+        if (phase === "playing") assert.match(lobby.message, /cancelled/);
+      }
+      assert.equal((await ack(room.host, "leave-room", { code: room.code })).success, false);
+      const leaked = [];
+      room.host.on("chat-message", (message) => leaked.push(message));
+      const newRoom = await ack(room.host, "CREATE_ROOM", { username: "New host", gameMode: mode });
+      assert.equal(newRoom.success, true);
+      const chat = next(guests[0], "chat-message");
+      guests[1].emit("chat-message", { code: room.code, text: "Still in the old room" });
+      await chat;
+      assert.deepEqual(leaked, []);
+      const newcomer = await connect(t);
+      const history = next(newcomer, "chat-history");
+      newcomer.emit("JOIN_ROOM", { code: room.code, username: "New guest" });
+      assert.equal((await history).messages.filter((message) => /Host quit the room/.test(message.text)).length, 1);
+    });
+  }
+}
+
+test("outsiders cannot quit another room, and quitting a bot room removes its last human", async (t) => {
+  const room = await makeRoom(t);
+  const outsider = await connect(t);
+  assert.equal((await ack(outsider, "leave-room", { code: room.code })).success, false);
+  const created = next(outsider, "room-created");
+  outsider.emit("create-bot-room", { username: "Solo" });
+  const botRoom = await created;
+  assert.equal((await ack(outsider, "leave-room", { code: botRoom.code })).success, true);
+  const rejected = next(outsider, "join-error");
+  outsider.emit("join-room", { code: botRoom.code, username: "Again" });
+  assert.equal((await rejected).message, "Room not found.");
 });
 
 test("Color Card shares targets and lets every player edit after everyone submits", async (t) => {
