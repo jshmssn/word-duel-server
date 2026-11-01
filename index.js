@@ -3,6 +3,8 @@ const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const wordsData = require("./words.json");
+const { roomOptions } = require("./src/config/gameModes");
+const { ColorCardRounds } = require("./src/socket/ColorCardSocket");
 const { createDatabase } = require("./src/database/connection");
 const { runMigrations } = require("./src/database/migrate");
 const { WORD_CHAIN_CONFIG } = require("./src/config/wordChain");
@@ -76,7 +78,34 @@ registerWordChainSocket({
   sessionRegistry: wordChainSessionRegistry,
 });
 
-const rooms = {};
+const rooms = Object.create(null);
+const colorCardRounds = new ColorCardRounds({ io, rooms, publicPlayers });
+const gameModeHandlers = {
+  "word-duel": { start: beginSlotMachine },
+  "color-card": { start: (code) => colorCardRounds.start(rooms[code]) },
+};
+
+function lobbyState(room) {
+  return {
+    code: room.code, creatorId: room.creatorId, players: publicPlayers(room),
+    mode: room.mode, gameMode: room.gameMode, maxPlayers: room.maxPlayers,
+    turnDuration: room.turnDuration, roundLimit: room.roundLimit,
+    colorDuration: room.colorDuration,
+    colorCardCount: room.colorCardCount,
+  };
+}
+
+function playerName(username) {
+  const name = typeof username === "string" ? username.trim().slice(0, 24) : "";
+  if (!name) throw new Error("Enter your name first.");
+  return name;
+}
+
+function beginRound(code) {
+  const room = rooms[code];
+  if (!room || room.state !== "waiting" || !roomReadyToStart(room)) return;
+  gameModeHandlers[room.gameMode].start(code);
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -266,13 +295,12 @@ function broadcastReadyState(code) {
   const room = rooms[code];
   if (!room) return;
   io.to(code).emit("ready-update", {
-    players: publicPlayers(room),
-    creatorId: room.creatorId,
+    ...lobbyState(room),
   });
 }
 
 function roomReadyToStart(room) {
-  return room.players.length === 2 && room.players.every((p) => p.ready);
+  return room.players.length >= 2 && room.players.length <= room.maxPlayers && room.players.every((p) => p.ready);
 }
 
 // ─── Countdown logic ─────────────────────────────────────────────────────────
@@ -297,7 +325,7 @@ function startCountdown(code) {
       if (count <= 0) {
         clearInterval(activeRoom.countdownInterval);
         activeRoom.countdownInterval = null;
-        beginSlotMachine(code);
+        beginRound(code);
       } else {
         io.to(code).emit("countdown", { count });
       }
@@ -357,7 +385,7 @@ function clearBotTimer(code) {
   }
 }
 
-function createRoomState(code, creatorId, username, { withBot = false } = {}) {
+function createRoomState(code, creatorId, username, { withBot = false, gameMode = "word-duel", maxPlayers = 2, colorDuration = 30, colorCardCount = 5 } = {}) {
   const players = [{ id: creatorId, username, ready: false, wins: 0 }];
 
   if (withBot) {
@@ -375,6 +403,13 @@ function createRoomState(code, creatorId, username, { withBot = false } = {}) {
     creatorId,
     players,
     mode: withBot ? "bot" : "duel",
+    gameMode,
+    maxPlayers,
+    colorRound: null,
+    colorMatch: null,
+    colorRanking: null,
+    colorDuration,
+    colorCardCount,
     state: "waiting",
     currentTurn: null,
     category: null,
@@ -403,75 +438,98 @@ function createRoomState(code, creatorId, username, { withBot = false } = {}) {
 
 io.on("connection", (socket) => {
   console.log(`[+] Connected: ${socket.id}`);
+  colorCardRounds.register(socket);
 
   // ── Create Room ──
-  socket.on("create-room", ({ username }) => {
-    let code;
-    do { code = generateRoomCode(); } while (rooms[code]);
+  const createRoom = (payload = {}, reply) => {
+    try {
+      if (socket.data.lobbyCode) throw new Error("You are already in a room.");
+      const { username, ...options } = payload || {};
+      const name = playerName(username);
+      const settings = roomOptions(options);
+      let code;
+      do { code = generateRoomCode(); } while (rooms[code]);
 
-    rooms[code] = createRoomState(code, socket.id, username);
+      rooms[code] = createRoomState(code, socket.id, name, settings);
 
-    socket.join(code);
-    socket.emit("room-created", {
-      code,
-      creatorId: socket.id,
-      turnDuration: rooms[code].turnDuration,
-      roundLimit: rooms[code].roundLimit,
-      players: publicPlayers(rooms[code]),
-    });
-    console.log(`[Room] ${code} created by ${username}`);
-  });
+      socket.join(code);
+      socket.data.lobbyCode = code;
+      const state = lobbyState(rooms[code]);
+      socket.emit("room-created", state);
+      if (typeof reply === "function") reply({ success: true, ...state });
+      console.log(`[Room] ${code} created by ${name}`);
+    } catch (error) {
+      socket.emit("join-error", { message: error.message });
+      if (typeof reply === "function") reply({ success: false, message: error.message });
+    }
+  };
+  socket.on("CREATE_ROOM", createRoom);
+  socket.on("create-room", createRoom);
 
-  socket.on("create-bot-room", ({ username }) => {
+  socket.on("create-bot-room", (payload = {}) => {
+    let username;
+    try {
+      if (socket.data.lobbyCode) throw new Error("You are already in a room.");
+      username = playerName(payload?.username);
+    } catch (error) { socket.emit("join-error", { message: error.message }); return; }
     let code;
     do { code = generateRoomCode(); } while (rooms[code]);
 
     rooms[code] = createRoomState(code, socket.id, username, { withBot: true });
 
     socket.join(code);
-    socket.emit("room-created", {
-      code,
-      creatorId: socket.id,
-      turnDuration: rooms[code].turnDuration,
-      roundLimit: rooms[code].roundLimit,
-      players: publicPlayers(rooms[code]),
-      mode: rooms[code].mode,
-    });
+    socket.data.lobbyCode = code;
+    socket.emit("room-created", lobbyState(rooms[code]));
     console.log(`[Bot Room] ${code} created by ${username}`);
   });
 
   // ── Join Room ──
-  socket.on("join-room", ({ code, username }) => {
+  const joinRoom = (payload = {}) => {
+    let code, username;
+    try {
+      if (socket.data.lobbyCode) throw new Error("You are already in a room.");
+      code = String(payload?.code || "").trim().toUpperCase();
+      username = playerName(payload?.username);
+    } catch (error) { socket.emit("join-error", { message: error.message }); return; }
     const room = rooms[code];
     if (!room) { socket.emit("join-error", { message: "Room not found." }); return; }
-    if (room.players.length >= 2) { socket.emit("join-error", { message: "Room is full." }); return; }
+    if (room.players.length >= room.maxPlayers) { socket.emit("join-error", { message: "Room is full." }); return; }
     if (room.state !== "waiting") { socket.emit("join-error", { message: "Game already in progress." }); return; }
 
     room.players.push({ id: socket.id, username, ready: false, wins: 0 });
     socket.join(code);
+    socket.data.lobbyCode = code;
+    clearCountdown(code);
 
     socket.emit("chat-history", { messages: room.chatHistory });
 
-    const joinedState = {
-      code,
-      players: publicPlayers(room),
-      turnDuration: room.turnDuration,
-      roundLimit: room.roundLimit,
-      creatorId: room.creatorId,
-      mode: room.mode,
-    };
+    const joinedState = lobbyState(room);
     io.to(code).emit("player-joined", joinedState);
     // Explicit acknowledgement prevents the joining client from showing a room
     // that rejected its code (e.g. a full room or a game already in progress).
     socket.emit("room-joined", joinedState);
 
     console.log(`[Room] ${username} joined ${code}`);
+  };
+  socket.on("JOIN_ROOM", joinRoom);
+  socket.on("join-room", joinRoom);
+
+  socket.on("START_GAME", (payload, reply) => {
+    const { code } = payload || {};
+    const room = rooms[code];
+    if (!room || room.creatorId !== socket.id || room.state !== "waiting" || !roomReadyToStart(room)) {
+      if (typeof reply === "function") reply({ success: false, message: "Only the host can start once all players are ready." });
+      return;
+    }
+    clearCountdown(code);
+    beginRound(code);
+    if (typeof reply === "function") reply({ success: true });
   });
 
   // ── Set Turn Timer ──
   socket.on("set-turn-duration", ({ code, turnDuration }) => {
     const room = rooms[code];
-    if (!room || room.state !== "waiting" || room.creatorId !== socket.id) return;
+    if (!room || room.gameMode !== "word-duel" || room.state !== "waiting" || room.creatorId !== socket.id) return;
 
     room.turnDuration = sanitizeTurnDuration(turnDuration);
     io.to(code).emit("turn-duration-update", {
@@ -482,7 +540,7 @@ io.on("connection", (socket) => {
 
   socket.on("set-round-limit", ({ code, roundLimit }) => {
     const room = rooms[code];
-    if (!room || room.state !== "waiting" || room.creatorId !== socket.id) return;
+    if (!room || room.gameMode !== "word-duel" || room.state !== "waiting" || room.creatorId !== socket.id) return;
 
     room.roundLimit = sanitizeRoundLimit(roundLimit);
     io.to(code).emit("round-limit-update", {
@@ -499,7 +557,7 @@ io.on("connection", (socket) => {
     if (!player) return;
     player.ready = !player.ready;
     broadcastReadyState(code);
-    const allReady = room.players.length === 2 && room.players.every((p) => p.ready);
+    const allReady = roomReadyToStart(room);
     if (allReady) startCountdown(code);
     else clearCountdown(code);
   });
@@ -513,7 +571,7 @@ io.on("connection", (socket) => {
     room.slotDoneIds.add(socket.id);
 
     const allDone =
-      room.players.length === 2 &&
+      room.players.length >= 2 &&
       getHumanPlayers(room).every((p) => room.slotDoneIds.has(p.id));
 
     if (allDone) startGame(code);
@@ -542,12 +600,12 @@ io.on("connection", (socket) => {
   // ── Ask Letter ── (now sends prompt to opponent instead of auto-resolving)
   socket.on("ask-letter", ({ code, letter }) => {
     const room = rooms[code];
-    if (!room || room.state !== "playing") return;
+    if (!room || room.gameMode !== "word-duel" || room.state !== "playing") return;
     if (room.currentTurn !== socket.id) { socket.emit("not-your-turn"); return; }
     if (room.pendingLetterAsk) { socket.emit("action-pending"); return; }
 
     letter = letter.toUpperCase();
-    const opponent = room.players.find((p) => p.id !== socket.id);
+    const opponent = getOpponent(room, socket.id);
     if (!opponent) return;
 
     // Store pending ask
@@ -578,12 +636,12 @@ io.on("connection", (socket) => {
   // ── Ask Letter Count ──
   socket.on("ask-letter-count", ({ code, letter }) => {
     const room = rooms[code];
-    if (!room || room.state !== "playing") return;
+    if (!room || room.gameMode !== "word-duel" || room.state !== "playing") return;
     if (room.currentTurn !== socket.id) { socket.emit("not-your-turn"); return; }
     if (room.pendingLetterCount) { socket.emit("action-pending"); return; }
 
     letter = letter.toUpperCase();
-    const opponent = room.players.find((p) => p.id !== socket.id);
+    const opponent = getOpponent(room, socket.id);
     if (!opponent) return;
 
     room.pendingLetterCount = { askerId: socket.id, letter };
@@ -611,7 +669,7 @@ io.on("connection", (socket) => {
   // ── Guess Word ──
   socket.on("guess-word", ({ code, guess }) => {
     const room = rooms[code];
-    if (!room || room.state !== "playing") return;
+    if (!room || room.gameMode !== "word-duel" || room.state !== "playing") return;
     if (room.currentTurn !== socket.id) { socket.emit("not-your-turn"); return; }
     finishGuess(code, socket.id, guess);
   });
@@ -619,7 +677,8 @@ io.on("connection", (socket) => {
   // ── Rematch ──
   socket.on("rematch", ({ code }) => {
     const room = rooms[code];
-    if (!room) return;
+    if (!room || room.state !== "ended" || !room.players.some((p) => p.id === socket.id)) return;
+    if (room.gameMode === "color-card" && room.colorMatch?.history.length < room.colorMatch?.targets.length) return;
     if (room.seriesOver && room.roundLimit > 1) {
       room.players.forEach((p) => (p.wins = 0));
     }
@@ -631,12 +690,11 @@ io.on("connection", (socket) => {
     clearCountdown(code);
     clearTurnTimer(code);
     clearBotTimer(code);
-    io.to(code).emit("rematch-lobby", {
-      players: publicPlayers(room),
-      turnDuration: room.turnDuration,
-      roundLimit: room.roundLimit,
-      creatorId: room.creatorId,
-    });
+    colorCardRounds.clear(code);
+    room.colorRound = null;
+    room.colorMatch = null;
+    room.colorRanking = null;
+    io.to(code).emit("rematch-lobby", lobbyState(room));
   });
 
   // ── Disconnect ──
@@ -650,8 +708,12 @@ io.on("connection", (socket) => {
         clearCountdown(code);
         clearTurnTimer(code);
         clearBotTimer(code);
+        colorCardRounds.clear(code);
+        room.colorRound = null;
+        room.colorMatch = null;
+        room.colorRanking = null;
         room.players.splice(idx, 1);
-        io.to(code).emit("player-left", { username: left.username, disconnected: true });
+        io.to(code).emit("player-left", { playerId: left.id, username: left.username, disconnected: true });
         if (room.players.length === 0 || room.players.every((p) => isBotPlayer(p))) {
           delete rooms[code];
           console.log(`[Room] ${code} deleted`);
@@ -664,6 +726,9 @@ io.on("connection", (socket) => {
           }
           room.players.forEach((p) => (p.ready = isBotPlayer(p)));
           broadcastReadyState(code);
+          if (room.gameMode === "color-card") {
+            io.to(code).emit("rematch-lobby", { ...lobbyState(room), message: "A player disconnected. The round was cancelled; ready up to play again." });
+          }
         }
         break;
       }
@@ -693,7 +758,9 @@ function beginSlotMachine(code) {
 }
 
 function getOpponent(room, playerId) {
-  return room.players.find((p) => p.id !== playerId);
+  // The next seat is the fixed opponent; with two players this is the existing duel.
+  const index = room.players.findIndex((p) => p.id === playerId);
+  return index < 0 ? null : room.players[(index + 1) % room.players.length];
 }
 
 function getLetterFrequency(word, letter) {
@@ -709,7 +776,7 @@ function answerPendingLetterAsk(code, responderId, answer) {
   if (!room || room.state !== "playing" || !room.pendingLetterAsk) return;
 
   const { askerId, letter } = room.pendingLetterAsk;
-  if (responderId === askerId) return;
+  if (responderId !== getOpponent(room, askerId)?.id) return;
 
   const asker = room.players.find((p) => p.id === askerId);
   const responder = room.players.find((p) => p.id === responderId);
@@ -739,7 +806,7 @@ function answerPendingLetterCount(code, responderId, count) {
   if (!room || room.state !== "playing" || !room.pendingLetterCount) return;
 
   const { askerId, letter } = room.pendingLetterCount;
-  if (responderId === askerId) return;
+  if (responderId !== getOpponent(room, askerId)?.id) return;
 
   const asker = room.players.find((p) => p.id === askerId);
   const responder = room.players.find((p) => p.id === responderId);
@@ -810,6 +877,7 @@ function finishGuess(code, guesserId, guess) {
       correctWord: room.words[opponent.id],
       loserWord: room.words[guesserId],
       wordsByPlayer: room.words,
+      opponentsByPlayer: Object.fromEntries(room.players.map((player) => [player.id, getOpponent(room, player.id).id])),
       ...seriesState,
     });
     return;
@@ -933,7 +1001,7 @@ function runBotTurn(code) {
 
 function startGame(code) {
   const room = rooms[code];
-  if (!room || room.players.length !== 2 || room.state === "playing") return;
+  if (!room || room.gameMode !== "word-duel" || room.players.length < 2 || room.state !== "slotting") return;
 
   const category = room.pendingCategory || pickCategory(room);
   if (!category) return;
@@ -956,13 +1024,17 @@ function startGame(code) {
 
   room.words[room.players[0].id] = word1;
   room.words[room.players[1].id] = word2;
-  room.currentTurn = room.players[Math.floor(Math.random() * 2)].id;
+  room.players.slice(2).forEach((p) => { room.words[p.id] = pickWord(category); });
+  room.currentTurn = room.players[Math.floor(Math.random() * room.players.length)].id;
 
   room.players.forEach((p) => {
     const myWord = room.words[p.id];
-    const opponentWord = room.words[room.players.find((op) => op.id !== p.id).id];
+    const opponent = getOpponent(room, p.id);
+    const opponentWord = room.words[opponent.id];
     if (isBotPlayer(p)) return;
     io.to(p.id).emit("game-start", {
+      gameMode: room.gameMode,
+      opponentId: opponent.id,
       category: category.name,
       myWord,
       myWordLetterCount: getLetterCount(myWord),
@@ -984,7 +1056,7 @@ function startGame(code) {
 function passTurn(code, fromTimeout = false) {
   const room = rooms[code];
   if (!room) return;
-  const other = room.players.find((p) => p.id !== room.currentTurn);
+  const other = getOpponent(room, room.currentTurn);
   if (other) {
     room.currentTurn = other.id;
     room.pendingLetterAsk = null;
@@ -996,4 +1068,8 @@ function passTurn(code, fromTimeout = false) {
 }
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`Word Duel server running on port ${PORT}`));
+if (require.main === module) {
+  server.listen(PORT, () => console.log(`Game lobby server running on port ${server.address().port}`));
+}
+
+module.exports = { server, io };
