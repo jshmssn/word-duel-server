@@ -101,7 +101,10 @@ class FinishWordRounds {
   resolve(room, outcome) {
     this.io.to(room.code).emit(outcome.accepted ? "word_accepted" : "word_rejected", {
       ...outcome, code: room.code, gameId: room.finishWordGame.id, serverNow: this.game.now(),
+      ...(outcome.retryable ? { turnId: room.finishWordGame.turnId } : {}),
     });
+    // Keep the existing timer and pending live-typing updates on a retry.
+    if (outcome.retryable) return;
     if (outcome.eliminatedPlayerIds?.length) this.io.to(room.code).emit("player_eliminated", {
       code: room.code, gameId: room.finishWordGame.id, playerIds: outcome.eliminatedPlayerIds,
     });
@@ -125,8 +128,8 @@ class FinishWordRounds {
         if (room.state !== "waiting") throw new Error("Characters can only be selected in the lobby.");
         if (!FINISH_WORD_CHARACTERS.includes(payload.characterId)) throw new Error("Choose one of the eight characters.");
         if (room.players.some((candidate) => candidate.id !== player.id && candidate.characterId === payload.characterId)) throw new Error("That character has already been selected.");
+        if (player.characterId !== payload.characterId) player.ready = false;
         player.characterId = payload.characterId;
-        player.ready = true;
         const players = this.publicPlayers(room);
         const state = { code: room.code, roomId: room.code, players, creatorId: room.creatorId,
           availableCharacters: FINISH_WORD_CHARACTERS.filter((id) => !players.some((candidate) => candidate.characterId === id)) };
@@ -169,7 +172,8 @@ class FinishWordRounds {
         const { room, player } = this.requirePlayer(socket, payload);
         if (room.state !== "playing") throw new Error("The match is not accepting words.");
         const outcome = this.game.submit(room.finishWordGame, { playerId: player.id, word: payload.word, turnId: payload.turnId });
-        if (typeof reply === "function") reply({ success: true, accepted: outcome.accepted, message: outcome.message });
+        if (typeof reply === "function") reply({ success: true, accepted: outcome.accepted,
+          retryable: Boolean(outcome.retryable), reason: outcome.reason, message: outcome.message });
         this.resolve(room, outcome);
       } catch (error) { if (typeof reply === "function") reply({ success: false, message: error.message }); }
     });

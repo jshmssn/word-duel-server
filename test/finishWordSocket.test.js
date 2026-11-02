@@ -17,7 +17,7 @@ function setup(t, { count = 3, start = true, dictionaryCount = 8 } = {}) {
   const manager = new FinishWordRounds({ rooms, dictionary,
     io: { to: (target) => ({ emit: (event, data) => events.push({ target, event, data: structuredClone(data) }) }) },
     publicPlayers: (target) => target.players.map((player) => ({ id: player.id, username: player.username, connected: player.connected, ready: player.ready, characterId: player.characterId, wins: player.wins })),
-    game: new FinishWordGame({ isValidWord: dictionary.isValidWord, randomLetter: () => "a" }),
+    game: new FinishWordGame({ isValidWord: dictionary.isValidWord, randomLetter: () => "a", randomPlayerIndex: () => 0 }),
   });
   t.after(() => manager.clear(room.code));
   const makeSocket = (id, playerId = id) => {
@@ -39,17 +39,21 @@ test("eight characters lock exclusively in real time and switching releases the 
   const { room, act, events } = setup(t, { start: false });
   assert.equal(new Set(FINISH_WORD_CHARACTERS).size, 8);
   const selected = act(0, "select_character", { characterId: "knight" });
-  assert.equal(selected.success, true); assert.equal(room.players[0].ready, true);
+  assert.equal(selected.success, true); assert.equal(room.players[0].ready, false);
+  room.players[0].ready = true;
+  act(0, "select_character", { characterId: "knight" });
+  assert.equal(room.players[0].ready, true, "reselecting the same character keeps readiness");
   assert.equal(selected.availableCharacters.includes("knight"), false);
   assert.equal(act(1, "select_character", { characterId: "knight" }).success, false);
   assert.equal(room.players[1].characterId, null);
   const switched = act(0, "select_character", { characterId: "wizard" });
   assert.equal(switched.success, true);
+  assert.equal(room.players[0].ready, false, "changing characters requires readying up again");
   assert.ok(switched.availableCharacters.includes("knight"));
   assert.equal(switched.availableCharacters.includes("wizard"), false);
   assert.equal(act(1, "select_character", { characterId: "knight", code: undefined, roomId: room.code }).success, true);
   assert.equal(room.players[0].characterId, "wizard"); assert.equal(room.players[1].characterId, "knight");
-  assert.equal(events.filter((entry) => entry.event === "character_selected").length, 3);
+  assert.equal(events.filter((entry) => entry.event === "character_selected").length, 4);
   assert.ok(events.every((entry) => entry.target === room.code));
 });
 
@@ -77,13 +81,13 @@ test("starting a game broadcasts its active turn, character/life roster and one 
   assert.equal(turns.length, 1);
   const state = turns[0].data;
   assert.equal(state.currentPlayerId, room.players[0].id); assert.equal(state.requiredPrefix, "a");
-  assert.equal(state.turnEndsAt - state.serverNow, 10000);
+  assert.equal(state.turnEndsAt - state.serverNow, 15000);
   assert.equal(state.players.length, 3); assert.ok(state.players.every((player) => player.lives === 3 && player.isAlive && player.characterId));
   assert.equal(state.roomId, room.code);
   assert.deepEqual(manager.snapshot(room).gameState, state);
   manager.schedule(room); manager.schedule(room);
   assert.equal(manager.timers.size, 1);
-  t.mock.timers.tick(10000);
+  t.mock.timers.tick(15000);
   assert.equal(events.filter((entry) => entry.event === "word_rejected").length, 1, "rescheduling must cancel duplicate callbacks");
 });
 
@@ -157,7 +161,7 @@ test("pausing cancels a trailing typing broadcast while preserving the latest re
   assert.equal(manager.snapshot(room).gameState.typingText, "app");
 });
 
-test("accepted and rejected words broadcast the outcome and new turn while keeping one timer", (t) => {
+test("accepted words advance while rejected attempts keep the original timer, turn and live typing", (t) => {
   const { room, manager, act, events, queries } = setup(t);
   const firstTurn = room.finishWordGame.turnId;
   const accepted = act(0, "submit_word", { word: " APPLE " });
@@ -167,12 +171,40 @@ test("accepted and rejected words broadcast the outcome and new turn while keepi
   assert.equal(events.filter((entry) => entry.event === "word_accepted").length, 1);
   assert.equal(events.filter((entry) => entry.event === "turn_start").at(-1).data.currentPlayerId, room.players[1].id);
   assert.equal(act(0, "submit_word", { word: "apple", turnId: firstTurn }).success, false);
+  const turnId = room.finishWordGame.turnId, deadline = room.finishWordGame.turnEndsAt;
+  const timer = manager.timers.get(room.code);
+  act(1, "player_typing", { text: "a" });
+  act(1, "player_typing", { text: "apple" });
+  t.mock.timers.tick(4000);
   const rejected = act(1, "submit_word", { word: "apple" });
   assert.equal(rejected.success, true, "a valid command may still contain a rejected word");
-  assert.equal(rejected.accepted, false); assert.equal(room.finishWordGame.players[1].lives, 2);
-  assert.equal(room.finishWordGame.currentTurnIndex, 2); assert.equal(manager.timers.size, 1);
+  assert.equal(rejected.accepted, false); assert.equal(rejected.retryable, true);
+  assert.equal(room.finishWordGame.players[1].lives, 3);
+  assert.equal(room.finishWordGame.currentTurnIndex, 1); assert.equal(manager.timers.size, 1);
+  assert.equal(manager.timers.get(room.code), timer);
+  assert.equal(room.finishWordGame.turnId, turnId); assert.equal(room.finishWordGame.turnEndsAt, deadline);
+  assert.equal(room.finishWordGame.typingText, "apple");
   assert.equal(events.filter((entry) => entry.event === "word_rejected").length, 1);
-  assert.equal(events.filter((entry) => entry.event === "turn_start").length, 3);
+  assert.equal(events.filter((entry) => entry.event === "turn_start").length, 2);
+  act(1, "player_typing", { text: "elephant" });
+  assert.equal(act(1, "submit_word", { word: "elephant", turnId }).accepted, true);
+  assert.equal(room.finishWordGame.currentTurnIndex, 2);
+  assert.equal(room.finishWordGame.players[1].lives, 3);
+});
+
+test("rejected attempts cannot delay or duplicate the existing timeout", (t) => {
+  const { room, manager, act, events } = setup(t);
+  const turnId = room.finishWordGame.turnId;
+  t.mock.timers.tick(14999);
+  assert.equal(act(0, "submit_word", { word: "azzzz" }).retryable, true);
+  assert.equal(act(0, "submit_word", { word: "azzzz" }).retryable, true);
+  assert.equal(room.finishWordGame.players[0].lives, 3);
+  t.mock.timers.tick(1);
+  assert.equal(room.finishWordGame.players[0].lives, 2);
+  assert.equal(room.finishWordGame.currentTurnIndex, 1);
+  assert.equal(events.filter((entry) => entry.event === "word_rejected" && entry.data.reason === "timeout").length, 1);
+  assert.equal(act(0, "submit_word", { word: "apple", turnId }).success, false);
+  assert.equal(manager.timers.size, 1);
 });
 
 test("outsider, stale and non-active submissions cannot consume lives or query SQLite", (t) => {
@@ -186,7 +218,7 @@ test("outsider, stale and non-active submissions cannot consume lives or query S
 test("the server deadline advances once and stale submissions cannot repeat its life penalty", (t) => {
   const { room, manager, act, events } = setup(t);
   const firstTurn = room.finishWordGame.turnId;
-  t.mock.timers.tick(9999);
+  t.mock.timers.tick(14999);
   assert.equal(room.finishWordGame.players[0].lives, 3);
   t.mock.timers.tick(1);
   assert.equal(room.finishWordGame.players[0].lives, 2);
@@ -207,16 +239,15 @@ test("pausing and resuming preserves typing and exactly the remaining turn time"
   const pauseDuration = Date.now() - room.pausedAt;
   room.pausedAt = null; manager.resume(room, pauseDuration);
   assert.equal(room.finishWordGame.typingText, "app"); assert.equal(room.finishWordGame.turnId, originalTurn);
-  assert.equal(room.finishWordGame.turnEndsAt - Date.now(), 7000);
-  t.mock.timers.tick(6999); assert.equal(room.finishWordGame.players[0].lives, 3);
+  assert.equal(room.finishWordGame.turnEndsAt - Date.now(), 12000);
+  t.mock.timers.tick(11999); assert.equal(room.finishWordGame.players[0].lives, 3);
   t.mock.timers.tick(1); assert.equal(room.finishWordGame.players[0].lives, 2);
 });
 
 test("elimination ends a two-player game, awards one win and cancels the countdown", (t) => {
-  const { room, manager, act, events } = setup(t, { count: 2 });
+  const { room, manager, events } = setup(t, { count: 2 });
   for (let index = 0; index < 5; index++) {
-    const active = room.finishWordGame.currentTurnIndex;
-    assert.equal(act(active, "submit_word", { word: "invalid" }).success, true);
+    t.mock.timers.tick(15000);
   }
   assert.equal(room.state, "ended"); assert.equal(manager.timers.size, 0);
   const ended = events.filter((entry) => entry.event === "game_over");
@@ -237,7 +268,7 @@ test("removing the active player continues with the next seat and rejects their 
   manager.removePlayer(room, removedId);
   const state = manager.state(room);
   assert.equal(state.players.length, 2); assert.equal(state.currentPlayerId, room.players[0].id);
-  assert.equal(state.turnEndsAt - state.serverNow, 10000); assert.equal(manager.timers.size, 1);
+  assert.equal(state.turnEndsAt - state.serverNow, 15000); assert.equal(manager.timers.size, 1);
   assert.equal(events.filter((entry) => entry.event === "player_eliminated").at(-1).data.playerIds[0], removedId);
   assert.equal(act(0, "submit_word", { word: "apple" }).success, false);
 });
@@ -252,7 +283,7 @@ test("removing an active player during a pause does not add the old pause to the
   manager.removePlayer(room, removedId);
   const duration = Date.now() - room.pausedAt;
   room.pausedAt = null; manager.resume(room, duration);
-  assert.equal(manager.state(room).turnEndsAt - Date.now(), 10000);
+  assert.equal(manager.state(room).turnEndsAt - Date.now(), 15000);
 });
 
 test("clearing a deleted or cancelled room prevents a stale timer from broadcasting", (t) => {

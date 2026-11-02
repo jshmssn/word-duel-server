@@ -12,7 +12,7 @@ function fixture({ count = 3, words = ["apple", "elephant", "turtle", "eagle", "
   let now = 1000;
   const queries = [];
   const dictionary = new Set(words);
-  const service = new FinishWordGame({ isValidWord: (word) => { queries.push(word); return dictionary.has(word); }, now: () => now, randomLetter: () => "A" });
+  const service = new FinishWordGame({ isValidWord: (word) => { queries.push(word); return dictionary.has(word); }, now: () => now, randomLetter: () => "A", randomPlayerIndex: () => 0 });
   const game = service.start(players.slice(0, count));
   const submit = (word, changes = {}) => service.submit(game, { playerId: game.players[game.currentTurnIndex]?.id, word, turnId: game.turnId, ...changes });
   return { service, game, submit, queries, setNow: (value) => { now = value; }, advance: (value) => { now += value; } };
@@ -23,7 +23,7 @@ test("a match starts with three lives, a server deadline, unique turn ID and saf
   const state = service.publicState(game);
   assert.equal(state.gameMode, "finish-word");
   assert.equal(state.status, "PLAYING"); assert.equal(state.currentPlayerId, "one");
-  assert.equal(state.turnDuration, 10); assert.equal(state.turnEndsAt, 11000);
+  assert.equal(state.turnDuration, 15); assert.equal(state.turnEndsAt, 16000);
   assert.equal(state.requiredPrefix, "a"); assert.equal(state.hardMode, false);
   assert.ok(state.turnId); assert.ok(state.gameId);
   assert.ok(state.players.every((player) => player.lives === 3 && player.isAlive));
@@ -35,6 +35,31 @@ test("a match starts with three lives, a server deadline, unique turn ID and saf
   assert.throws(() => service.start([players[0]]), /2 to 8/);
   assert.throws(() => service.start([players[0], players[0]]), /unique/);
   assert.throws(() => service.start(players, { turnDuration: 0 }), /duration/);
+});
+
+test("each new round draws a starting player and keeps the normal circular turn order", () => {
+  const choices = [2, 0, 1];
+  const service = new FinishWordGame({ isValidWord: () => true, randomLetter: () => "a",
+    randomPlayerIndex: (count) => { assert.equal(count, players.length); return choices.shift(); } });
+  for (const expectedIndex of [2, 0, 1]) {
+    const game = service.start(players);
+    assert.equal(game.currentTurnIndex, expectedIndex);
+    assert.deepEqual(game.players.map((player) => player.id), players.map((player) => player.id));
+    service.submit(game, { playerId: players[expectedIndex].id, turnId: game.turnId, word: "apple" });
+    assert.equal(game.currentTurnIndex, (expectedIndex + 1) % players.length);
+  }
+});
+
+test("all submission whitespace is removed before dictionary, prefix and duplicate validation", () => {
+  const { game, submit, queries } = fixture();
+  assert.equal(submit(" \tA p\np\rl\u00a0e\u2003 ").accepted, true);
+  assert.deepEqual(queries, ["apple"]);
+  assert.equal(game.lastWord, "apple");
+  assert.equal(submit("e l e p h a n t").accepted, true);
+  assert.equal(game.requiredPrefix, "t");
+  game.requiredPrefix = "a";
+  assert.equal(submit(" A P P L E ").reason, "already_used");
+  assert.equal(game.players[2].lives, 3);
 });
 
 test("case-insensitive exact dictionary matches advance the last-letter chain without changing lives", () => {
@@ -53,26 +78,31 @@ test("case-insensitive exact dictionary matches advance the last-letter chain wi
 });
 
 for (const [word, reason] of [["a", "too_short"], ["a!", "invalid_format"], ["elephant", "wrong_prefix"], ["abcdefgh", "not_in_dictionary"], [null, "too_short"], ["a".repeat(MAX_WORD_LENGTH + 1), "invalid_format"]]) {
-  test(`invalid submission (${reason}) costs one life and passes exactly one turn`, () => {
-    const { game, submit, queries } = fixture();
+  test(`invalid submission (${reason}) allows a retry without changing the turn or deadline`, () => {
+    const { service, game, submit, queries, advance } = fixture();
+    advance(4000);
+    const before = service.publicState(game);
     const outcome = submit(word);
     assert.equal(outcome.accepted, false); assert.equal(outcome.reason, reason);
+    assert.equal(outcome.retryable, true);
     assert.equal(outcome.playerId, "one"); assert.deepEqual(outcome.eliminatedPlayerIds, []);
-    assert.equal(game.players[0].lives, 2); assert.equal(game.currentTurnIndex, 1);
+    assert.deepEqual(service.publicState(game), before);
     assert.equal(game.requiredPrefix, "a"); assert.equal(game.lastWord, null);
     assert.equal(game.usedWordsSet.size, 0);
     if (reason !== "not_in_dictionary") assert.equal(queries.length, 0);
+    advance(10999);
+    assert.equal(submit("apple").accepted, true, "a valid retry works until the original deadline");
+    assert.equal(game.players[0].lives, 3); assert.equal(game.currentTurnIndex, 1);
   });
 }
 
-test("oversized invalid words lose one life without retaining or broadcasting the oversized payload", () => {
+test("oversized invalid words preserve the turn without retaining or broadcasting the oversized payload", () => {
   const { service, game, submit, queries } = fixture();
   const outcome = submit("A".repeat(200000));
   assert.equal(outcome.accepted, false); assert.equal(outcome.reason, "invalid_format");
-  assert.equal(game.players[0].lives, 2); assert.equal(game.currentTurnIndex, 1);
+  assert.equal(game.players[0].lives, 3); assert.equal(game.currentTurnIndex, 0);
   assert.equal(outcome.word.length, MAX_WORD_LENGTH);
-  assert.equal(game.history[0].word.length, MAX_WORD_LENGTH);
-  assert.equal(service.publicState(game).history[0].word.length, MAX_WORD_LENGTH);
+  assert.deepEqual(service.publicState(game).history, []);
   assert.equal(queries.length, 0); assert.equal(game.usedWordsSet.size, 0);
   assert.equal(game.lastWord, null);
 });
@@ -82,8 +112,10 @@ test("a used word is rejected case-insensitively for the rest of the match", () 
   submit("at"); submit("tea");
   const outcome = submit("AT");
   assert.equal(outcome.reason, "already_used");
-  assert.equal(game.players[2].lives, 2);
-  assert.equal(game.lastWord, "tea"); assert.equal(game.usedWordsSet.size, 2);
+  assert.equal(game.players[2].lives, 3);
+  assert.equal(game.currentTurnIndex, 2);
+  assert.equal(submit("apple").accepted, true);
+  assert.equal(game.lastWord, "apple"); assert.equal(game.usedWordsSet.size, 3);
 });
 
 test("unknown players, stale actions and out-of-turn players cannot damage a player or query the dictionary", () => {
@@ -112,11 +144,31 @@ test("a deadline timeout costs one life exactly once and a late word never reach
   assert.throws(() => submit("apple", { playerId: "one", turnId: originalTurn }));
 });
 
+test("repeated invalid attempts preserve the draft and cannot extend the timeout or prevent elimination", () => {
+  const { service, game, submit, advance, setNow } = fixture({ count: 2 });
+  game.players[0].lives = 1;
+  const turnId = game.turnId, deadline = game.turnEndsAt;
+  service.updateTyping(game, { playerId: "one", text: "azzzz", turnId });
+  for (let index = 0; index < 5; index++) {
+    advance(1000);
+    assert.equal(submit("azzzz").retryable, true);
+    assert.equal(game.turnId, turnId); assert.equal(game.turnEndsAt, deadline);
+    assert.equal(game.typingText, "azzzz"); assert.equal(game.players[0].lives, 1);
+  }
+  setNow(deadline);
+  const outcome = submit("apple");
+  assert.equal(outcome.reason, "timeout"); assert.equal(outcome.gameOver, true);
+  assert.deepEqual(outcome.eliminatedPlayerIds, ["one"]);
+  assert.equal(game.winnerId, "two");
+  assert.equal(service.expire(game, turnId), null);
+});
+
 test("eliminated players are skipped and the last survivor ends the match", () => {
-  const { service, game, submit } = fixture({ count: 2 });
-  for (let round = 0; round < 2; round++) { submit("bad"); submit("bad"); }
+  const { service, game, submit, setNow } = fixture({ count: 2 });
+  const timeout = () => { setNow(game.turnEndsAt); return service.expire(game, game.turnId); };
+  for (let round = 0; round < 2; round++) { timeout(); timeout(); }
   assert.ok(game.players.every((player) => player.lives === 1));
-  const outcome = submit("bad");
+  const outcome = timeout();
   assert.deepEqual(outcome.eliminatedPlayerIds, ["one"]); assert.equal(outcome.gameOver, true);
   assert.equal(game.status, "ENDED"); assert.equal(game.winnerId, "two"); assert.equal(game.winnerName, "Two");
   assert.equal(game.turnId, null); assert.equal(game.turnEndsAt, null);
@@ -126,12 +178,13 @@ test("eliminated players are skipped and the last survivor ends the match", () =
 });
 
 test("surviving turns skip eliminated seats while retaining them in the scene", () => {
-  const { service, game, submit } = fixture();
+  const { service, game, submit, setNow } = fixture();
+  const timeout = () => { setNow(game.turnEndsAt); return service.expire(game, game.turnId); };
   game.players[1].lives = 1;
-  submit("bad");
-  assert.deepEqual(submit("bad").eliminatedPlayerIds, ["two"]);
+  timeout();
+  assert.deepEqual(timeout().eliminatedPlayerIds, ["two"]);
   assert.equal(service.publicState(game).currentPlayerId, "three");
-  submit("bad");
+  timeout();
   assert.equal(service.publicState(game).currentPlayerId, "one");
   assert.equal(game.players.length, 3);
   assert.throws(() => submit("apple", { playerId: "two" }), /eliminated/);
@@ -201,7 +254,7 @@ test("removing the active player continues with the following seat and a fresh d
   const outcome = service.removePlayer(game, "one");
   assert.equal(outcome.reason, "removed"); assert.equal(outcome.gameOver, false);
   assert.equal(game.players.length, 2); assert.equal(service.publicState(game).currentPlayerId, "two");
-  assert.notEqual(game.turnId, turnId); assert.equal(game.turnEndsAt, 16000);
+  assert.notEqual(game.turnId, turnId); assert.equal(game.turnEndsAt, 21000);
 });
 
 test("removing a seat before the current player preserves their turn, deadline and typing", () => {

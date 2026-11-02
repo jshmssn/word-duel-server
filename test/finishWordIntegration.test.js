@@ -56,31 +56,51 @@ async function makeRoom(t, { count = 2, start = true } = {}) {
   }
   if (!start) return { room, sockets, host };
   for (const [index, socket] of sockets.entries()) assert.equal((await ack(socket, "select_character", { roomId: room.code, characterId: ["knight", "wizard", "ninja", "robot"][index] })).success, true);
+  for (const socket of sockets) assert.equal((await ack(socket, "toggle-ready", { code: room.code })).ready, true);
   const started = next(host, "turn_start");
   assert.equal((await ack(host, "start_game", { roomId: room.code })).success, true);
   return { room, sockets, host, state: await started };
 }
 
-test("join_room aliases, server-exclusive character ownership and host-only selected starts work on real sockets", async (t) => {
+test("character ownership, explicit ready toggles and host-only ready starts work on real sockets", async (t) => {
   const { room, sockets, host } = await makeRoom(t, { start: false });
   const guest = sockets[1], outsider = await connect(t);
+  assert.equal((await ack(host, "toggle-ready", { code: room.code })).success, false, "choose a character before readying up");
+  assert.equal((await ack(outsider, "toggle-ready", { code: room.code })).success, false);
   assert.equal((await ack(host, "start_game", { roomId: room.code })).success, false, "every player must choose a character first");
   const simultaneous = await Promise.all(sockets.map((socket) => ack(socket, "select_character", { roomId: room.code, characterId: "knight" })));
   assert.equal(simultaneous.filter((response) => response.success).length, 1);
   const losingIndex = simultaneous.findIndex((response) => !response.success);
   const chosen = await ack(sockets[losingIndex], "select_character", { code: room.code, characterId: "wizard" });
   assert.equal(chosen.success, true); assert.equal(new Set(chosen.players.map((player) => player.characterId)).size, 2);
+  assert.ok(chosen.players.every((player) => !player.ready), "character selection does not ready players");
+  assert.equal((await ack(host, "start_game", { code: room.code })).success, false);
+  const readyUpdate = next(guest, "ready-update");
+  assert.equal((await ack(host, "toggle-ready", { code: room.code })).ready, true);
+  const readyState = await readyUpdate;
+  assert.equal(readyState.changedPlayerId, host.session.playerId);
+  assert.equal(readyState.players.find((player) => player.id === host.session.playerId).ready, true);
+  assert.equal((await ack(host, "start_game", { code: room.code })).success, false, "every player must be ready");
+  assert.equal((await ack(guest, "toggle-ready", { code: room.code })).ready, true);
+  assert.equal((await ack(host, "toggle-ready", { code: room.code })).ready, false);
+  assert.equal((await ack(host, "start_game", { code: room.code })).success, false, "unreadying blocks start");
+  assert.equal((await ack(host, "toggle-ready", { code: room.code })).ready, true);
+  assert.equal((await ack(host, "select_character", { code: room.code, characterId: "robot" })).success, true);
+  assert.equal((await ack(host, "start_game", { code: room.code })).success, false, "changing character clears readiness");
+  assert.equal((await ack(host, "toggle-ready", { code: room.code })).ready, true);
   assert.equal((await ack(guest, "start_game", { roomId: room.code })).success, false);
   assert.equal((await ack(outsider, "join_room", { roomId: room.code, name: "Extra" })).success, false);
   const turn = next(host, "turn_start");
   assert.equal((await ack(host, "start_game", { roomId: room.code })).success, true);
   assert.equal((await turn).players.length, 2);
   assert.equal((await ack(host, "select_character", { roomId: room.code, characterId: "dino" })).success, false);
+  assert.equal((await ack(host, "toggle-ready", { code: room.code })).success, false);
 });
 
 test("real typing and word submissions validate the SQLite source and broadcast one authoritative next turn", async (t) => {
-  const { room, sockets, host, state } = await makeRoom(t);
-  const guest = sockets[1];
+  const { room, sockets, state } = await makeRoom(t);
+  const host = sockets.find((socket) => socket.session.playerId === state.currentPlayerId);
+  const guest = sockets.find((socket) => socket !== host);
   const word = dictionary.find((candidate) => candidate.startsWith(state.requiredPrefix));
   assert.ok(word);
   const typing = next(guest, "player_typing");
@@ -88,7 +108,7 @@ test("real typing and word submissions validate the SQLite source and broadcast 
   assert.equal((await typing).text, word.slice(0, 3));
   assert.equal((await ack(guest, "submit_word", { roomId: room.code, turnId: state.turnId, word })).success, false);
   const accepted = next(guest, "word_accepted"), nextTurn = next(guest, "turn_start");
-  const response = await ack(host, "submit_word", { roomId: room.code, turnId: state.turnId, word: word.toUpperCase() });
+  const response = await ack(host, "submit_word", { roomId: room.code, turnId: state.turnId, word: ` \t${word.toUpperCase().split("").join(" ")}\n` });
   assert.equal(response.success, true); assert.equal(response.accepted, true);
   assert.equal((await accepted).word, word);
   const following = await nextTurn;
@@ -96,30 +116,37 @@ test("real typing and word submissions validate the SQLite source and broadcast 
   assert.equal(following.requiredPrefix, word.slice(-1)); assert.deepEqual(following.usedWords, [word]);
   assert.equal(following.typingText, ""); assert.ok(following.players.every((player) => player.lives === 3));
   assert.equal((await ack(host, "submit_word", { roomId: room.code, turnId: state.turnId, word })).success, false);
-  const rejected = next(host, "word_rejected"), afterFailure = next(host, "turn_start");
+  const rejected = next(host, "word_rejected");
   const failure = await ack(guest, "submit_word", { roomId: room.code, turnId: following.turnId, word: `${following.requiredPrefix}zzzzzzz` });
   assert.equal(failure.success, true); assert.equal(failure.accepted, false);
-  assert.equal((await rejected).reason, "not_in_dictionary");
-  const remaining = await afterFailure;
-  assert.equal(remaining.players.find((player) => player.id === guest.session.playerId).lives, 2);
+  assert.equal(failure.retryable, true);
+  const rejection = await rejected;
+  assert.equal(rejection.reason, "not_in_dictionary"); assert.equal(rejection.turnId, following.turnId);
+  const nextWord = dictionary.find((candidate) => candidate.startsWith(following.requiredPrefix));
+  const afterRetry = next(host, "turn_start");
+  assert.equal((await ack(guest, "submit_word", { code: room.code, turnId: following.turnId, word: nextWord })).accepted, true);
+  const remaining = await afterRetry;
+  assert.equal(remaining.players.find((player) => player.id === guest.session.playerId).lives, 3);
   assert.equal(remaining.currentPlayerId, host.session.playerId);
+  assert.deepEqual(remaining.usedWords, [word, nextWord]);
 });
 
-test("a real 10-second server deadline rejects an unanswered turn without any client timer event", { timeout: 15000 }, async (t) => {
+test("a real 15-second server deadline rejects an unanswered turn without any client timer event", { timeout: 20000 }, async (t) => {
   const { sockets, host, state } = await makeRoom(t);
-  const rejected = next(host, "word_rejected", { timeout: 12000 }), nextTurn = next(host, "turn_start", { timeout: 12000 });
-  assert.equal(state.turnDuration, 10);
+  const rejected = next(host, "word_rejected", { timeout: 18000 }), nextTurn = next(host, "turn_start", { timeout: 18000 });
+  assert.equal(state.turnDuration, 15);
   const failure = await rejected;
-  assert.equal(failure.reason, "timeout"); assert.equal(failure.playerId, host.session.playerId);
+  assert.equal(failure.reason, "timeout"); assert.equal(failure.playerId, state.currentPlayerId);
   const following = await nextTurn;
-  assert.equal(following.currentPlayerId, sockets[1].session.playerId);
-  assert.equal(following.players.find((player) => player.id === host.session.playerId).lives, 2);
+  assert.equal(following.currentPlayerId, sockets[(state.currentTurnIndex + 1) % sockets.length].session.playerId);
+  assert.equal(following.players.find((player) => player.id === state.currentPlayerId).lives, 2);
   assert.notEqual(following.turnId, state.turnId);
 });
 
 test("a transport replacement restores its character, lives, typing and turn in a full active room", async (t) => {
-  const { room, sockets, host, state } = await makeRoom(t);
-  const guest = sockets[1], session = host.session;
+  const { room, sockets, state } = await makeRoom(t);
+  const host = sockets.find((socket) => socket.session.playerId === state.currentPlayerId);
+  const guest = sockets.find((socket) => socket !== host), session = host.session;
   await ack(host, "player_typing", { code: room.code, turnId: state.turnId, text: state.requiredPrefix.toUpperCase() });
   const paused = next(guest, "ROOM_PAUSED"); host.io.engine.close(); await paused;
   assert.equal((await ack(guest, "submit_word", { code: room.code, turnId: state.turnId, word: "apple" })).success, false);
@@ -130,13 +157,13 @@ test("a transport replacement restores its character, lives, typing and turn in 
   assert.equal(snapshot.players.length, 2); assert.equal(snapshot.screen, "game"); assert.equal(snapshot.pausedAt, null);
   assert.equal(snapshot.gameState.gameId, state.gameId); assert.equal(snapshot.gameState.turnId, state.turnId);
   assert.equal(snapshot.gameState.typingText, state.requiredPrefix.toUpperCase());
-  assert.equal(snapshot.gameState.players.find((player) => player.id === session.playerId).characterId, "knight");
+  assert.equal(snapshot.gameState.players.find((player) => player.id === session.playerId).characterId, state.players[state.currentTurnIndex].characterId);
   assert.ok(snapshot.gameState.players.every((player) => player.lives === 3));
 });
 
-test("an active reconnecting player can be kicked by a majority and the next player gets 10 seconds", async (t) => {
-  const { room, sockets, host, state } = await makeRoom(t, { count: 3 });
-  const [, first, second] = sockets;
+test("an active reconnecting player can be kicked by a majority and the next player gets 15 seconds", async (t) => {
+  const { room, sockets, state } = await makeRoom(t, { count: 3 });
+  const [host, first, second] = [...sockets.slice(state.currentTurnIndex), ...sockets.slice(0, state.currentTurnIndex)];
   const opened = next(first, "ROOM_KICK_VOTES", { accepts: (data) => data.kickVotes.length > 0 });
   host.emit("suspend-room", { code: room.code });
   const vote = (await opened).kickVotes[0];
@@ -150,29 +177,29 @@ test("an active reconnecting player can be kicked by a majority and the next pla
   assert.equal(snapshot.pausedAt, null); assert.equal(snapshot.players.length, 2);
   assert.equal(snapshot.gameState.gameId, state.gameId);
   assert.equal(snapshot.gameState.currentPlayerId, first.session.playerId);
-  assert.ok(snapshot.availableCharacters.includes("knight"));
+  assert.ok(snapshot.availableCharacters.includes(state.players[state.currentTurnIndex].characterId));
   const remaining = snapshot.gameState.turnEndsAt - snapshot.gameState.serverNow;
-  assert.ok(remaining <= 10000 && remaining >= 9900, `Expected a fresh 10s turn, received ${remaining}ms`);
+  assert.ok(remaining <= 15000 && remaining >= 14900, `Expected a fresh 15s turn, received ${remaining}ms`);
   assert.equal((await ack(host, "resume-room", host.session)).success, false);
 });
 
-test("elimination broadcasts a winner and a rematch creates a fresh match with the selected characters", async (t) => {
+test("timeout elimination broadcasts a winner and rematches require fresh readiness", { timeout: 90000 }, async (t) => {
   const { room, sockets, host, state: initial } = await makeRoom(t);
   let state = initial;
   for (let turn = 0; turn < 5; turn++) {
-    const active = sockets.find((socket) => socket.session.playerId === state.currentPlayerId);
-    const changed = next(host, turn === 4 ? "game_over" : "turn_start");
-    const response = await ack(active, "submit_word", { code: room.code, turnId: state.turnId, word: `${state.requiredPrefix}zzzzzzz` });
-    assert.equal(response.success, true); assert.equal(response.accepted, false);
+    const changed = next(host, turn === 4 ? "game_over" : "turn_start", { timeout: 18000 });
     state = await changed;
   }
-  assert.equal(state.status, "ENDED"); assert.equal(state.winnerId, sockets[1].session.playerId);
-  assert.equal(state.players.find((player) => player.id === host.session.playerId).lives, 0);
+  assert.equal(state.status, "ENDED"); assert.equal(state.winnerId, sockets.find((socket) => socket.session.playerId !== initial.currentPlayerId).session.playerId);
+  assert.equal(state.players.find((player) => player.id === initial.currentPlayerId).lives, 0);
   const lobby = next(host, "rematch-lobby"); host.emit("rematch", { code: room.code });
   const waiting = await lobby;
   assert.equal(waiting.gameMode, "finish-word"); assert.equal(waiting.availableCharacters.length, 6);
+  assert.ok(waiting.players.every((player) => !player.ready));
   assert.equal((await ack(host, "submit_word", { code: room.code, turnId: initial.turnId, word: "apple" })).success, false);
   const started = next(host, "turn_start");
+  assert.equal((await ack(host, "start_game", { code: room.code })).success, false);
+  for (const socket of sockets) assert.equal((await ack(socket, "toggle-ready", { code: room.code })).ready, true);
   assert.equal((await ack(host, "start_game", { roomId: room.code })).success, true);
   const rematch = await started;
   assert.notEqual(rematch.gameId, initial.gameId); assert.deepEqual(rematch.usedWords, []);
@@ -181,8 +208,8 @@ test("elimination broadcasts a winner and a rematch creates a fresh match with t
 });
 
 test("explicit departures preserve the active match and the last remaining player wins", async (t) => {
-  const { room, sockets, host, state } = await makeRoom(t, { count: 3 });
-  const [, nextPlayer, survivor] = sockets;
+  const { room, sockets, state } = await makeRoom(t, { count: 3 });
+  const [host, nextPlayer, survivor] = [...sockets.slice(state.currentTurnIndex), ...sockets.slice(0, state.currentTurnIndex)];
   const word = dictionary.find((candidate) => candidate.startsWith(state.requiredPrefix));
   const nextTurn = next(nextPlayer, "turn_start", { accepts: (snapshot) => snapshot.turnId !== state.turnId && snapshot.currentPlayerId === nextPlayer.session.playerId });
   await ack(host, "submit_word", { code: room.code, turnId: state.turnId, word });

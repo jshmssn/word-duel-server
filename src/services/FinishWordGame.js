@@ -1,16 +1,16 @@
 const { randomInt, randomUUID } = require("node:crypto");
 
 const STARTING_LIVES = 3;
-const TURN_DURATION_SECONDS = 10;
+const TURN_DURATION_SECONDS = 15;
 const HARD_MODE_AFTER = 10;
 const MAX_WORD_LENGTH = 64;
 
 // The transport owns room membership, pause state and scheduling. This engine
 // owns every rule and deadline, so a client can never award itself a word/life.
 class FinishWordGame {
-  constructor({ isValidWord, now = Date.now, randomLetter = () => String.fromCharCode(97 + randomInt(26)) } = {}) {
+  constructor({ isValidWord, now = Date.now, randomLetter = () => String.fromCharCode(97 + randomInt(26)), randomPlayerIndex = randomInt } = {}) {
     if (typeof isValidWord !== "function") throw new TypeError("Provide an SQLite-backed isValidWord function.");
-    Object.assign(this, { isValidWord, now, randomLetter });
+    Object.assign(this, { isValidWord, now, randomLetter, randomPlayerIndex });
   }
 
   start(players, { turnDuration = TURN_DURATION_SECONDS, hardModeAfter = HARD_MODE_AFTER } = {}) {
@@ -20,13 +20,15 @@ class FinishWordGame {
     if (!Number.isInteger(hardModeAfter) || hardModeAfter < 1 || hardModeAfter > 1000) throw new Error("Choose a hard-mode threshold from 1 to 1000 accepted words.");
     const letter = String(this.randomLetter()).toLowerCase();
     if (!/^[a-z]$/.test(letter)) throw new Error("The starting letter must be a single English letter.");
+    const firstPlayer = this.randomPlayerIndex(players.length);
+    if (!Number.isInteger(firstPlayer) || firstPlayer < 0 || firstPlayer >= players.length) throw new Error("Choose a valid starting player.");
     const game = {
       id: randomUUID(), status: "PLAYING",
       players: players.map((player) => {
         const name = String(player.username || player.name || "Player").trim().slice(0, 24) || "Player";
         return { id: player.id, username: name, name, characterId: player.characterId || null, lives: STARTING_LIVES, isAlive: true };
       }),
-      currentTurnIndex: 0, turnId: null, turnDuration, turnEndsAt: null,
+      currentTurnIndex: firstPlayer, turnId: null, turnDuration, turnEndsAt: null,
       lastWord: null, requiredPrefix: letter, usedWordsSet: new Set(),
       successfulTurns: 0, hardModeAfter, typingText: "", history: [],
       winnerId: null, winnerName: null,
@@ -64,7 +66,7 @@ class FinishWordGame {
     const player = this.requireTurn(game, playerId, turnId);
     // The deadline wins a race with any delayed client packet or timer callback.
     if (this.now() >= game.turnEndsAt) return this.expire(game, turnId);
-    const word = typeof submittedWord === "string" ? submittedWord.trim().toLowerCase() : "";
+    const word = typeof submittedWord === "string" ? submittedWord.replace(/\s/g, "").toLowerCase() : "";
     let reason, message;
     if (word.length < 2) {
       reason = "too_short"; message = "Use a word with at least 2 letters.";
@@ -77,7 +79,11 @@ class FinishWordGame {
     } else if (this.isValidWord(word) !== true) {
       reason = "not_in_dictionary"; message = "That word is not in the dictionary.";
     }
-    if (reason) return this.loseLife(game, player, { reason, message, word: word.slice(0, MAX_WORD_LENGTH) });
+    // A rejected attempt leaves the turn and its original deadline intact.
+    // Only running out of time costs a life.
+    if (reason) return { accepted: false, retryable: true, reason, message,
+      word: word.slice(0, MAX_WORD_LENGTH), playerId: player.id,
+      eliminatedPlayerIds: [], gameOver: false };
 
     const requiredPrefix = game.requiredPrefix;
     game.usedWordsSet.add(word);

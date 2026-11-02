@@ -328,8 +328,8 @@ function broadcastReadyState(code, changedPlayerId) {
 }
 
 function roomReadyToStart(room) {
-  if (room.gameMode === "finish-word") return !room.pausedAt && room.players.length >= 2 &&
-    room.players.every((player) => player.connected !== false && FINISH_WORD_CHARACTERS.includes(player.characterId)) &&
+  if (room.gameMode === "finish-word") return !room.pausedAt && room.players.length >= 2 && room.players.length <= room.maxPlayers &&
+    room.players.every((player) => player.ready && player.connected !== false && FINISH_WORD_CHARACTERS.includes(player.characterId)) &&
     new Set(room.players.map((player) => player.characterId)).size === room.players.length;
   return !room.pausedAt && room.players.length >= 2 && room.players.length <= room.maxPlayers && room.players.every((p) => p.ready && p.connected !== false);
 }
@@ -915,16 +915,20 @@ io.on("connection", (socket) => {
   });
 
   // ── Toggle Ready ──
-  socket.on("toggle-ready", ({ code }) => {
+  socket.on("toggle-ready", (payload = {}, reply) => {
+    const code = payload.code || payload.roomId;
     const room = rooms[code];
-    if (!room || room.state !== "waiting" || room.gameMode === "finish-word") return;
-    const player = room.players.find((p) => p.id === lobbyPlayerId(socket));
-    if (!player) return;
+    const player = room?.players.find((p) => p.id === lobbyPlayerId(socket) && p.socketId === socket.id && p.connected !== false);
+    const reject = (message) => { if (typeof reply === "function") reply({ success: false, message }); };
+    if (!room || socket.data.lobbyCode !== code || !player) return reject("You are not an active member of this room.");
+    if (room.state !== "waiting") return reject("You can only change readiness in the lobby.");
+    if (room.pausedAt) return reject("The room is paused while a player reconnects.");
+    if (room.gameMode === "finish-word" && !FINISH_WORD_CHARACTERS.includes(player.characterId)) return reject("Choose a character before readying up.");
     player.ready = !player.ready;
     broadcastReadyState(code, lobbyPlayerId(socket));
-    const allReady = roomReadyToStart(room);
-    if (allReady) startCountdown(code);
+    if (room.gameMode !== "finish-word" && roomReadyToStart(room)) startCountdown(code);
     else clearCountdown(code);
+    if (typeof reply === "function") reply({ success: true, ready: player.ready });
   });
 
   socket.on("slot-machine-done", ({ code }) => {
