@@ -9,6 +9,8 @@ const RECONNECT_KICK_DELAY_MS = Number(process.env.RECONNECT_KICK_DELAY_MS) || 4
 const wordsData = require("./words.json");
 const { roomOptions } = require("./src/config/gameModes");
 const { ColorCardRounds } = require("./src/socket/ColorCardSocket");
+const { FinishWordRounds, FINISH_WORD_CHARACTERS } = require("./src/socket/FinishWordSocket");
+const { createFinishWordDictionary } = require("./src/services/FinishWordDictionary");
 const { createDatabase } = require("./src/database/connection");
 const { runMigrations } = require("./src/database/migrate");
 const { WORD_CHAIN_CONFIG } = require("./src/config/wordChain");
@@ -84,9 +86,14 @@ registerWordChainSocket({
 
 const rooms = Object.create(null);
 const colorCardRounds = new ColorCardRounds({ io, rooms, publicPlayers });
+const finishWordDictionary = createFinishWordDictionary({
+  ...(process.env.WORD_CHAIN_DB_PATH === ":memory:" && !process.env.FINISH_WORD_DB_PATH ? { databasePath: ":memory:" } : {}),
+});
+const finishWordRounds = new FinishWordRounds({ io, rooms, publicPlayers, dictionary: finishWordDictionary });
 const gameModeHandlers = {
   "word-duel": { start: beginSlotMachine },
   "color-card": { start: (code) => colorCardRounds.start(rooms[code]) },
+  "finish-word": { start: (code) => finishWordRounds.start(rooms[code]) },
 };
 
 function lobbyState(room) {
@@ -98,6 +105,11 @@ function lobbyState(room) {
     colorCardCount: room.colorCardCount,
     pausedAt: room.pausedAt || null,
     kickVotes: publicKickVotes(room),
+    ...(room.gameMode === "finish-word" ? {
+      roomId: room.code,
+      availableCharacters: FINISH_WORD_CHARACTERS.filter((id) => !room.players.some((player) => player.characterId === id)),
+      gameStatus: room.state === "waiting" ? "LOBBY" : room.state === "ended" ? "ENDED" : "PLAYING",
+    } : {}),
   };
 }
 
@@ -297,6 +309,7 @@ function publicPlayers(room) {
     connected: p.connected !== false,
     connectionStatus: p.connected !== false ? "connected" : "reconnecting",
     kickEligibleAt: p.kickEligibleAt || null,
+    ...(room.gameMode === "finish-word" ? { name: p.username, characterId: p.characterId || null } : {}),
     ...(room.gameMode === "color-card" && room.state === "waiting" ? {
       previousMatchAverageAccuracy: p.previousMatchAverageAccuracy || 0,
       previousMatchCardCount: p.previousMatchCardCount || 0,
@@ -315,6 +328,9 @@ function broadcastReadyState(code, changedPlayerId) {
 }
 
 function roomReadyToStart(room) {
+  if (room.gameMode === "finish-word") return !room.pausedAt && room.players.length >= 2 &&
+    room.players.every((player) => player.connected !== false && FINISH_WORD_CHARACTERS.includes(player.characterId)) &&
+    new Set(room.players.map((player) => player.characterId)).size === room.players.length;
   return !room.pausedAt && room.players.length >= 2 && room.players.length <= room.maxPlayers && room.players.every((p) => p.ready && p.connected !== false);
 }
 
@@ -425,6 +441,7 @@ function createRoomState(code, creatorId, username, { withBot = false, gameMode 
     colorRound: null,
     colorMatch: null,
     colorRanking: null,
+    finishWordGame: null,
     colorDuration,
     colorCardCount,
     state: "waiting",
@@ -477,6 +494,7 @@ function attachRoomSession(socket, room, player) {
 function personalRoomState(room, playerId) {
   let state = {};
   if (room.gameMode === "color-card" && room.colorRound) state = colorCardRounds.snapshot(room, playerId);
+  else if (room.gameMode === "finish-word" && room.finishWordGame) state = finishWordRounds.snapshot(room);
   else if (room.state === "playing") {
     const opponent = getOpponent(room, playerId);
     const prompt = (pending) => pending && getOpponent(room, pending.askerId)?.id === playerId
@@ -517,6 +535,7 @@ function pauseRoom(room, player) {
     clearTurnTimer(room.code);
     clearBotTimer(room.code);
     colorCardRounds.clear(room.code);
+    finishWordRounds.clear(room.code);
   }
   io.to(room.code).emit("ROOM_PAUSED", {
     code: room.code, players: publicPlayers(room), pausedAt: room.pausedAt,
@@ -531,12 +550,13 @@ function resumeRoom(room) {
   const duration = Date.now() - room.pausedAt;
   room.pausedAt = null;
   if (room.gameMode === "color-card" && room.colorRound) colorCardRounds.resume(room, duration);
+  else if (room.gameMode === "finish-word" && room.finishWordGame) finishWordRounds.resume(room, duration);
   else if (room.state === "playing") {
     if (!room.pendingLetterAsk && !room.pendingLetterCount) {
       startTurnTimer(room.code, room.turnRemaining);
       scheduleBotTurnIfNeeded(room.code);
     }
-  } else if (room.state === "waiting" && roomReadyToStart(room)) startCountdown(room.code);
+  } else if (room.state === "waiting" && room.gameMode !== "finish-word" && roomReadyToStart(room)) startCountdown(room.code);
   io.to(room.code).emit("ROOM_RESUMED", { code: room.code, players: publicPlayers(room), message: "The remaining players are connected. The game has resumed!" });
   sendRoomSnapshots(room);
   if (room.state === "slotting") io.to(room.code).emit("category-selected", { category: room.category, selectedCategoryName: room.category });
@@ -605,7 +625,7 @@ function restoreRoomSession(socket, session) {
   else {
     socket.emit("room-restored", personalRoomState(room, player.id));
     if (room.pausedAt) publishKickVotes(room);
-    else if (room.state === "waiting" && roomReadyToStart(room)) startCountdown(room.code);
+    else if (room.state === "waiting" && room.gameMode !== "finish-word" && roomReadyToStart(room)) startCountdown(room.code);
   }
 }
 
@@ -625,6 +645,7 @@ function kickReconnectingPlayer(room, playerId) {
   }
   if (room.creatorId === playerId) room.creatorId = getHumanPlayers(room)[0]?.id || room.players[0]?.id;
   if (room.gameMode === "color-card") colorCardRounds.removePlayer(room, playerId);
+  else if (room.gameMode === "finish-word") finishWordRounds.removePlayer(room, playerId);
   else {
     // The next player in lobby order becomes the new target. Knowledge about
     // the removed target must not carry over to a different secret word.
@@ -671,6 +692,21 @@ function leaveRoom(socket, disconnected = false) {
   clearTimeout(left.reconnectTimer);
   clearTimeout(left.kickTimer);
   room.kickVotes.delete(left.id);
+  if (room.gameMode === "finish-word" && room.state === "playing") {
+    socket.leave(code); socket.leave(left.id); socket.data.lobbyCode = null;
+    if (!getHumanPlayers(room).length) {
+      finishWordRounds.clear(code); delete rooms[code]; return;
+    }
+    if (room.creatorId === left.id) room.creatorId = getHumanPlayers(room)[0].id;
+    finishWordRounds.removePlayer(room, left.id);
+    io.to(code).emit("player-left", { code, playerId: left.id, username: left.username, disconnected,
+      message: `${left.username} left the match.` });
+    if (room.pausedAt) {
+      if (room.players.some((player) => player.connected === false)) { publishKickVotes(room); sendRoomSnapshots(room); }
+      else resumeRoom(room);
+    }
+    return;
+  }
   const cancelled = !["waiting", "ended"].includes(room.state);
   socket.leave(code);
   socket.data.lobbyCode = null;
@@ -678,6 +714,8 @@ function leaveRoom(socket, disconnected = false) {
   clearTurnTimer(code);
   clearBotTimer(code);
   colorCardRounds.clear(code);
+  finishWordRounds.clear(code);
+  room.finishWordGame = null;
   room.colorRound = null;
   room.colorMatch = null;
   room.colorRanking = null;
@@ -711,9 +749,10 @@ function leaveRoom(socket, disconnected = false) {
 io.on("connection", (socket) => {
   console.log(`[+] Connected: ${lobbyPlayerId(socket)}`);
   colorCardRounds.register(socket);
+  finishWordRounds.register(socket);
   socket.use(([event, , reply], next) => {
     const room = rooms[socket.data.lobbyCode];
-    if (room?.pausedAt && !["resume-room", "suspend-room", "leave-room", "chat-message", "VOTE_ROOM_KICK", "JOIN_ROOM", "join-room"].includes(event)) {
+    if (room?.pausedAt && !["resume-room", "suspend-room", "leave-room", "chat-message", "VOTE_ROOM_KICK", "JOIN_ROOM", "join-room", "join_room"].includes(event)) {
       const response = { success: false, message: "The room is paused while a player reconnects." };
       if (typeof reply === "function") reply(response);
       else socket.emit("room-action-error", response);
@@ -794,23 +833,28 @@ io.on("connection", (socket) => {
   });
 
   // ── Join Room ──
-  const joinRoom = (payload = {}) => {
+  const joinRoom = (payload = {}, reply) => {
     let code, username;
+    const reject = (message) => {
+      socket.emit("join-error", { message });
+      if (typeof reply === "function") reply({ success: false, message });
+    };
     try {
       // Authenticate an existing slot before checking capacity or game phase.
       const session = payload.session || (socket.data.lobbyCode && socket.handshake.auth?.session);
-      if (session?.code === String(payload.code || "").trim().toUpperCase()) {
+      if (session?.code === String(payload.code || payload.roomId || "").trim().toUpperCase()) {
         restoreRoomSession(socket, session);
+        if (typeof reply === "function") reply({ success: true, ...personalRoomState(rooms[session.code], session.playerId) });
         return;
       }
       if (socket.data.lobbyCode) throw new Error("You are already in a room.");
-      code = String(payload?.code || "").trim().toUpperCase();
-      username = playerName(payload?.username);
-    } catch (error) { socket.emit("join-error", { message: error.message }); return; }
+      code = String(payload?.code || payload?.roomId || "").trim().toUpperCase();
+      username = playerName(payload?.username || payload?.name);
+    } catch (error) { reject(error.message); return; }
     const room = rooms[code];
-    if (!room) { socket.emit("join-error", { message: "Room not found." }); return; }
-    if (room.players.length >= room.maxPlayers) { socket.emit("join-error", { message: "Room is full." }); return; }
-    if (room.state !== "waiting") { socket.emit("join-error", { message: "Game already in progress." }); return; }
+    if (!room) { reject("Room not found."); return; }
+    if (room.players.length >= room.maxPlayers) { reject("Room is full."); return; }
+    if (room.state !== "waiting") { reject("Game already in progress."); return; }
 
     room.players.push({ id: lobbyPlayerId(socket), username, ready: false, wins: 0 });
     attachRoomSession(socket, room, room.players.at(-1));
@@ -823,23 +867,29 @@ io.on("connection", (socket) => {
     // Explicit acknowledgement prevents the joining client from showing a room
     // that rejected its code (e.g. a full room or a game already in progress).
     socket.emit("room-joined", joinedState);
+    if (typeof reply === "function") reply({ success: true, ...joinedState });
 
     console.log(`[Room] ${username} joined ${code}`);
   };
   socket.on("JOIN_ROOM", joinRoom);
   socket.on("join-room", joinRoom);
+  socket.on("join_room", joinRoom);
 
-  socket.on("START_GAME", (payload, reply) => {
-    const { code } = payload || {};
+  const startRoomGame = (payload, reply) => {
+    const code = payload?.code || payload?.roomId;
     const room = rooms[code];
-    if (!room || room.creatorId !== lobbyPlayerId(socket) || room.state !== "waiting" || !roomReadyToStart(room)) {
+    if (!room || socket.data.lobbyCode !== code || room.creatorId !== lobbyPlayerId(socket) || room.state !== "waiting" || !roomReadyToStart(room)) {
       if (typeof reply === "function") reply({ success: false, message: "Only the host can start once all players are ready." });
       return;
     }
-    clearCountdown(code);
-    beginRound(code);
-    if (typeof reply === "function") reply({ success: true });
-  });
+    try {
+      clearCountdown(code);
+      beginRound(code);
+      if (typeof reply === "function") reply({ success: true });
+    } catch (error) { if (typeof reply === "function") reply({ success: false, message: error.message }); }
+  };
+  socket.on("START_GAME", startRoomGame);
+  socket.on("start_game", startRoomGame);
 
   // ── Set Turn Timer ──
   socket.on("set-turn-duration", ({ code, turnDuration }) => {
@@ -867,7 +917,7 @@ io.on("connection", (socket) => {
   // ── Toggle Ready ──
   socket.on("toggle-ready", ({ code }) => {
     const room = rooms[code];
-    if (!room || room.state !== "waiting") return;
+    if (!room || room.state !== "waiting" || room.gameMode === "finish-word") return;
     const player = room.players.find((p) => p.id === lobbyPlayerId(socket));
     if (!player) return;
     player.ready = !player.ready;
@@ -1006,6 +1056,8 @@ io.on("connection", (socket) => {
     clearTurnTimer(code);
     clearBotTimer(code);
     colorCardRounds.clear(code);
+    finishWordRounds.clear(code);
+    room.finishWordGame = null;
     room.colorRound = null;
     room.colorMatch = null;
     room.colorRanking = null;

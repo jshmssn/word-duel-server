@@ -3,6 +3,7 @@ const { colorDuration: validateColorDuration, colorCardCount: validateColorCardC
 const GAME_MODES = Object.freeze({
   "word-duel": { id: "word-duel", name: "Word Duel" },
   "color-card": { id: "color-card", name: "Color Card" },
+  "finish-word": { id: "finish-word", name: "Finish the Word" },
 });
 
 function roomOptions({ gameMode = "word-duel", maxPlayers = 2, colorDuration = 30, colorCardCount = 5 } = {}) {
