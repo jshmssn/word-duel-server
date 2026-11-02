@@ -89,7 +89,8 @@ const colorCardRounds = new ColorCardRounds({ io, rooms, publicPlayers });
 const finishWordDictionary = createFinishWordDictionary({
   ...(process.env.WORD_CHAIN_DB_PATH === ":memory:" && !process.env.FINISH_WORD_DB_PATH ? { databasePath: ":memory:" } : {}),
 });
-const finishWordRounds = new FinishWordRounds({ io, rooms, publicPlayers, dictionary: finishWordDictionary });
+const finishWordRounds = new FinishWordRounds({ io, rooms, publicPlayers, dictionary: finishWordDictionary,
+  onLobbyChanged: (room) => clearCountdown(room.code) });
 const gameModeHandlers = {
   "word-duel": { start: beginSlotMachine },
   "color-card": { start: (code) => colorCardRounds.start(rooms[code]) },
@@ -556,7 +557,7 @@ function resumeRoom(room) {
       startTurnTimer(room.code, room.turnRemaining);
       scheduleBotTurnIfNeeded(room.code);
     }
-  } else if (room.state === "waiting" && room.gameMode !== "finish-word" && roomReadyToStart(room)) startCountdown(room.code);
+  } else if (room.state === "waiting" && roomReadyToStart(room)) startCountdown(room.code);
   io.to(room.code).emit("ROOM_RESUMED", { code: room.code, players: publicPlayers(room), message: "The remaining players are connected. The game has resumed!" });
   sendRoomSnapshots(room);
   if (room.state === "slotting") io.to(room.code).emit("category-selected", { category: room.category, selectedCategoryName: room.category });
@@ -625,7 +626,7 @@ function restoreRoomSession(socket, session) {
   else {
     socket.emit("room-restored", personalRoomState(room, player.id));
     if (room.pausedAt) publishKickVotes(room);
-    else if (room.state === "waiting" && room.gameMode !== "finish-word" && roomReadyToStart(room)) startCountdown(room.code);
+    else if (room.state === "waiting" && roomReadyToStart(room)) startCountdown(room.code);
   }
 }
 
@@ -926,7 +927,7 @@ io.on("connection", (socket) => {
     if (room.gameMode === "finish-word" && !FINISH_WORD_CHARACTERS.includes(player.characterId)) return reject("Choose a character before readying up.");
     player.ready = !player.ready;
     broadcastReadyState(code, lobbyPlayerId(socket));
-    if (room.gameMode !== "finish-word" && roomReadyToStart(room)) startCountdown(code);
+    if (roomReadyToStart(room)) startCountdown(code);
     else clearCountdown(code);
     if (typeof reply === "function") reply({ success: true, ready: player.ready });
   });

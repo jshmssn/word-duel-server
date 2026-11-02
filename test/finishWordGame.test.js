@@ -144,7 +144,7 @@ test("a deadline timeout costs one life exactly once and a late word never reach
   assert.throws(() => submit("apple", { playerId: "one", turnId: originalTurn }));
 });
 
-test("repeated invalid attempts preserve the draft and cannot extend the timeout or prevent elimination", () => {
+test("repeated invalid attempts clear the draft and cannot extend the timeout or prevent elimination", () => {
   const { service, game, submit, advance, setNow } = fixture({ count: 2 });
   game.players[0].lives = 1;
   const turnId = game.turnId, deadline = game.turnEndsAt;
@@ -153,7 +153,7 @@ test("repeated invalid attempts preserve the draft and cannot extend the timeout
     advance(1000);
     assert.equal(submit("azzzz").retryable, true);
     assert.equal(game.turnId, turnId); assert.equal(game.turnEndsAt, deadline);
-    assert.equal(game.typingText, "azzzz"); assert.equal(game.players[0].lives, 1);
+    assert.equal(game.typingText, ""); assert.equal(game.players[0].lives, 1);
   }
   setNow(deadline);
   const outcome = submit("apple");
@@ -161,6 +161,47 @@ test("repeated invalid attempts preserve the draft and cannot extend the timeout
   assert.deepEqual(outcome.eliminatedPlayerIds, ["one"]);
   assert.equal(game.winnerId, "two");
   assert.equal(service.expire(game, turnId), null);
+});
+
+test("a full cycle of timeouts chooses new letters and keeps used words and hard-mode progress", () => {
+  let now = 0;
+  const service = new FinishWordGame({ isValidWord: () => true, now: () => now,
+    randomLetter: () => "a", randomPlayerIndex: () => 0,
+    getStartingPrefixes: (length) => length === 2 ? ["le", "br"] : ["e", "b"] });
+  for (const hardModeAfter of [1, 10]) {
+    const game = service.start(players, { hardModeAfter });
+    service.submit(game, { playerId: "one", word: "apple", turnId: game.turnId });
+    const prefix = game.requiredPrefix;
+    for (let turn = 0; turn < 3; turn++) {
+      now = game.turnEndsAt;
+      const outcome = service.expire(game, game.turnId);
+      if (turn < 2) { assert.equal(game.requiredPrefix, prefix); assert.equal(outcome.prefixChanged, undefined); }
+      else { assert.equal(outcome.prefixChanged, true); assert.match(outcome.message, /Nobody found a word/); }
+    }
+    assert.equal(game.requiredPrefix, hardModeAfter === 1 ? "br" : "b");
+    assert.equal(game.lastWord, null); assert.equal(game.successfulTurns, 1);
+    assert.deepEqual([...game.usedWordsSet], ["apple"]);
+    assert.equal(game.turnEndsAt - now, 15000);
+    assert.ok(game.players.every((player) => player.lives === 2));
+  }
+});
+
+test("an accepted word restarts the failed-player cycle and eliminated seats are skipped", () => {
+  const { service, game, submit, setNow } = fixture();
+  const timeout = () => { setNow(game.turnEndsAt); return service.expire(game, game.turnId); };
+  timeout();
+  assert.equal(submit("apple").accepted, true);
+  timeout(); timeout();
+  assert.equal(game.requiredPrefix, "e", "earlier failures do not count after an accepted word");
+  assert.equal(timeout().prefixChanged, true);
+  assert.notEqual(game.requiredPrefix, "e");
+  const other = fixture();
+  const expireOther = () => { other.setNow(other.game.turnEndsAt); return other.service.expire(other.game, other.game.turnId); };
+  other.game.players[0].lives = 1;
+  assert.deepEqual(expireOther().eliminatedPlayerIds, ["one"]);
+  const prefix = other.game.requiredPrefix;
+  expireOther(); expireOther();
+  assert.notEqual(other.game.requiredPrefix, prefix, "only remaining players need to time out");
 });
 
 test("eliminated players are skipped and the last survivor ends the match", () => {

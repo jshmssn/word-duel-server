@@ -99,10 +99,14 @@ function createFinishWordDictionary(options = {}) {
       importResult = { imported: false, count, sourceSha256: seeded.value };
     }
     const findWord = database.prepare("SELECT 1 FROM words WHERE word = ? LIMIT 1");
+    const prefixes = new Map([1, 2].map((length) => [length,
+      database.prepare("SELECT DISTINCT substr(word, 1, ?) AS prefix FROM words WHERE length(word) >= 2").all(length).map((row) => row.prefix),
+    ]));
     return {
       ...importResult,
       filePath,
       databasePath,
+      getStartingPrefixes(length) { return [...(prefixes.get(length) || [])]; },
       isValidWord(word) {
         const normalized = normalizeWord(word);
         return /^[a-z]+$/.test(normalized) && Boolean(findWord.get(normalized));

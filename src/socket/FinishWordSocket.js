@@ -5,9 +5,10 @@ const FINISH_WORD_CHARACTERS = Object.freeze(["knight", "wizard", "ninja", "robo
 // Transport and scheduling live here; the rules and SQLite queries are injected
 // so deadline handling can be tested without a browser or wall-clock sleeps.
 class FinishWordRounds {
-  constructor({ io, rooms, publicPlayers, dictionary, game }) {
-    Object.assign(this, { io, rooms, publicPlayers, dictionary });
-    this.game = game || new FinishWordGame({ isValidWord: (word) => dictionary.isValidWord(word) });
+  constructor({ io, rooms, publicPlayers, dictionary, game, onLobbyChanged }) {
+    Object.assign(this, { io, rooms, publicPlayers, dictionary, onLobbyChanged });
+    this.game = game || new FinishWordGame({ isValidWord: (word) => dictionary.isValidWord(word),
+      getStartingPrefixes: (length) => dictionary.getStartingPrefixes(length) });
     this.timers = new Map();
     this.typingTimers = new Map();
   }
@@ -103,8 +104,13 @@ class FinishWordRounds {
       ...outcome, code: room.code, gameId: room.finishWordGame.id, serverNow: this.game.now(),
       ...(outcome.retryable ? { turnId: room.finishWordGame.turnId } : {}),
     });
-    // Keep the existing timer and pending live-typing updates on a retry.
-    if (outcome.retryable) return;
+    // Clear the rejected draft for every spectator without resetting the timer.
+    if (outcome.retryable) {
+      this.clearTyping(room.code);
+      this.io.to(room.code).emit("player_typing", { code: room.code, gameId: room.finishWordGame.id,
+        turnId: room.finishWordGame.turnId, playerId: outcome.playerId, text: "" });
+      return;
+    }
     if (outcome.eliminatedPlayerIds?.length) this.io.to(room.code).emit("player_eliminated", {
       code: room.code, gameId: room.finishWordGame.id, playerIds: outcome.eliminatedPlayerIds,
     });
@@ -128,12 +134,14 @@ class FinishWordRounds {
         if (room.state !== "waiting") throw new Error("Characters can only be selected in the lobby.");
         if (!FINISH_WORD_CHARACTERS.includes(payload.characterId)) throw new Error("Choose one of the eight characters.");
         if (room.players.some((candidate) => candidate.id !== player.id && candidate.characterId === payload.characterId)) throw new Error("That character has already been selected.");
-        if (player.characterId !== payload.characterId) player.ready = false;
+        const changed = player.characterId !== payload.characterId;
+        if (changed) player.ready = false;
         player.characterId = payload.characterId;
         const players = this.publicPlayers(room);
         const state = { code: room.code, roomId: room.code, players, creatorId: room.creatorId,
           availableCharacters: FINISH_WORD_CHARACTERS.filter((id) => !players.some((candidate) => candidate.characterId === id)) };
         this.io.to(room.code).emit("character_selected", state);
+        if (changed) this.onLobbyChanged?.(room);
         if (typeof reply === "function") reply({ success: true, ...state });
       } catch (error) { if (typeof reply === "function") reply({ success: false, message: error.message }); }
     });

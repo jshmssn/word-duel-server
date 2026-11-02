@@ -131,6 +131,32 @@ test("real typing and word submissions validate the SQLite source and broadcast 
   assert.deepEqual(remaining.usedWords, [word, nextWord]);
 });
 
+test("readiness automatically starts the shared countdown and unreadying or switching characters cancels it", { timeout: 20000 }, async (t) => {
+  const { room, sockets, host } = await makeRoom(t, { start: false });
+  const guest = sockets[1];
+  for (const [index, socket] of sockets.entries()) {
+    await ack(socket, "select_character", { code: room.code, characterId: index ? "wizard" : "knight" });
+    await ack(socket, "toggle-ready", { code: room.code });
+  }
+  const firstCountdown = await next(host, "countdown");
+  assert.equal(firstCountdown.count, 5);
+  const cancelled = next(host, "countdown-cancel");
+  assert.equal((await ack(guest, "toggle-ready", { code: room.code })).ready, false);
+  await cancelled;
+  assert.equal((await ack(guest, "toggle-ready", { code: room.code })).ready, true);
+  assert.equal((await next(host, "countdown")).count, 5);
+  const changedCharacter = next(host, "countdown-cancel");
+  const switched = await ack(guest, "select_character", { code: room.code, characterId: "ninja" });
+  assert.equal(switched.players.find((player) => player.id === guest.session.playerId).ready, false);
+  await changedCharacter;
+  const autoStarted = next(host, "turn_start", { timeout: 10000 });
+  await ack(guest, "toggle-ready", { code: room.code });
+  const state = await autoStarted;
+  assert.equal(state.turnDuration, 15);
+  assert.ok(state.players.some((player) => player.id === state.currentPlayerId));
+  assert.equal(state.players.find((player) => player.id === guest.session.playerId).characterId, "ninja");
+});
+
 test("a real 15-second server deadline rejects an unanswered turn without any client timer event", { timeout: 20000 }, async (t) => {
   const { sockets, host, state } = await makeRoom(t);
   const rejected = next(host, "word_rejected", { timeout: 18000 }), nextTurn = next(host, "turn_start", { timeout: 18000 });

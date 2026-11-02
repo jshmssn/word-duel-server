@@ -161,7 +161,7 @@ test("pausing cancels a trailing typing broadcast while preserving the latest re
   assert.equal(manager.snapshot(room).gameState.typingText, "app");
 });
 
-test("accepted words advance while rejected attempts keep the original timer, turn and live typing", (t) => {
+test("accepted words advance while rejected attempts clear live typing and keep the original timer and turn", (t) => {
   const { room, manager, act, events, queries } = setup(t);
   const firstTurn = room.finishWordGame.turnId;
   const accepted = act(0, "submit_word", { word: " APPLE " });
@@ -183,13 +183,25 @@ test("accepted words advance while rejected attempts keep the original timer, tu
   assert.equal(room.finishWordGame.currentTurnIndex, 1); assert.equal(manager.timers.size, 1);
   assert.equal(manager.timers.get(room.code), timer);
   assert.equal(room.finishWordGame.turnId, turnId); assert.equal(room.finishWordGame.turnEndsAt, deadline);
-  assert.equal(room.finishWordGame.typingText, "apple");
+  assert.equal(room.finishWordGame.typingText, "");
+  assert.equal(events.filter((entry) => entry.event === "player_typing").at(-1).data.text, "");
   assert.equal(events.filter((entry) => entry.event === "word_rejected").length, 1);
   assert.equal(events.filter((entry) => entry.event === "turn_start").length, 2);
   act(1, "player_typing", { text: "elephant" });
   assert.equal(act(1, "submit_word", { word: "elephant", turnId }).accepted, true);
   assert.equal(room.finishWordGame.currentTurnIndex, 2);
   assert.equal(room.finishWordGame.players[1].lives, 3);
+});
+
+test("everyone timing out broadcasts new letters without resetting lives or successful-word progress", (t) => {
+  const { room, events } = setup(t);
+  const originalPrefix = room.finishWordGame.requiredPrefix;
+  for (let turn = 0; turn < 3; turn++) t.mock.timers.tick(15000);
+  const state = events.filter((entry) => entry.event === "turn_start").at(-1).data;
+  assert.notEqual(state.requiredPrefix, originalPrefix);
+  assert.equal(state.turnEndsAt - state.serverNow, 15000);
+  assert.ok(state.players.every((player) => player.lives === 2));
+  assert.equal(events.filter((entry) => entry.event === "word_rejected").at(-1).data.prefixChanged, true);
 });
 
 test("rejected attempts cannot delay or duplicate the existing timeout", (t) => {

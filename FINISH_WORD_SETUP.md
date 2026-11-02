@@ -45,11 +45,11 @@ Open **http://localhost:5173**. The development client connects to **http://loca
 1. Select **Finish the Word** in the game hub, enter your name, choose a capacity from 2 to 8, and create a room.
 2. Other players enter their names and join with the room code. Separate browser tabs can be used to test multiple players locally.
 3. Each player selects one of eight characters: Knight, Wizard, Ninja, Robot, Alien, Pirate, Astronaut, or Dino. A chosen character is locked for everyone else immediately. Choosing another character releases the previous one.
-4. Every player, including the host, clicks **Ready up**. Once the room has 2–8 players, all ready, connected and each with a unique character, the host starts the match. Players can unready; changing characters clears readiness. Rematches require everyone to ready up again.
+4. Every player, including the host, clicks **Ready up**. Once the room has 2–8 players, all ready, connected and each with a unique character, the shared five-second countdown starts the match automatically after the same two-second settling delay as Word Duel and Color Card. Players can unready; changing characters clears readiness and cancels the countdown. Rematches require everyone to ready up again.
 5. The server randomly chooses the starting letter and first player for each new match. The active player has **15 seconds** and starts with **3 hearts**. Only that player's word input is active and automatically focused.
 6. A submission must contain at least **2 letters**, exist in the imported SQLite dictionary after lowercase normalization, begin with the required prefix, and be unused in the current match. Validation is an exact whole-word lookup, not a prefix vocabulary search.
 7. Accepted words set the next required prefix to their last letter: `APPLE → ELEPHANT → TURTLE`. After **10 accepted words**, hard mode requires the last **two** letters of the previous accepted word instead.
-8. An invalid submission keeps the player's hearts, turn, draft and original deadline intact. The input shakes (unless reduced motion is enabled) and plays a wrong sound when sound is enabled. The player can correct and resubmit while time remains. Only a timeout costs **one heart and the turn**. The previous accepted word/prefix remains in effect after a timeout. A stale or out-of-turn network action returns an error without deducting a heart.
+8. An invalid submission clears the player's input and live typing bubble while preserving hearts, turn and the original deadline. The input shakes (unless reduced motion is enabled) and plays a wrong sound when sound is enabled. The player can correct and resubmit while time remains. Only a timeout costs **one heart and the turn**. The prefix remains in effect until every remaining player times out without an accepted word. The server then chooses a different dictionary-backed prefix of the current one- or two-letter length and clears the previous-word prompt. Hard-mode progress and used words are preserved. A stale or out-of-turn network action returns an error without deducting a heart.
 9. Players with zero hearts are eliminated and can watch. The last player with hearts remaining wins.
 
 The stage uses eight distinct **2D SVG characters**. Floating nametags and heart counters identify each player. A smooth stage/camera transition focuses on the active character at each turn; reduced-motion preferences are respected. The active player's current typing appears publicly in a speech bubble, so other players can see the live word before submission.
@@ -81,7 +81,7 @@ Room codes are the room IDs. Room actions accept `code`; Finish the Word aliases
 | `CREATE_ROOM` | `{ username, gameMode: "finish-word", maxPlayers }` | Creates a room through the existing hub flow. |
 | `join_room` | `{ code, username }` or `{ roomId, name }` | Joins the existing room; `JOIN_ROOM` and `join-room` remain compatible. |
 | `select_character` | `{ code, characterId }` | Claims an available character in the lobby; IDs are `knight`, `wizard`, `ninja`, `robot`, `alien`, `pirate`, `astronaut`, `dino`. |
-| `toggle-ready` | `{ code }` | Toggles readiness after choosing a character; broadcasts `ready-update`. |
+| `toggle-ready` | `{ code }` | Toggles readiness after choosing a character; broadcasts `ready-update` and starts/cancels the shared automatic countdown. |
 | `start_game` | `{ code }` | Host-only start after all room members are ready, connected and have selected unique characters. |
 | `player_typing` | `{ code, turnId, text }` | Broadcasts the current active player's sanitized typing to the room. |
 | `submit_word` | `{ code, turnId, word }` | Validates an attempt; accepted words and timeouts resolve the turn, while invalid words allow retries. |
@@ -93,6 +93,7 @@ Actions support acknowledgement callbacks. A transport/ownership/stale-turn fail
 | `room-created`, `room-joined`, `player-joined` | Existing room/lobby snapshots and roster updates. |
 | `character_selected` | Current roster, character ownership, and `availableCharacters`. |
 | `ready-update` | Current lobby roster/readiness and the player whose readiness changed. |
+| `countdown`, `countdown-cancel` | The shared five-second ready-up countdown or its cancellation. |
 | `turn_start` | Complete new-turn snapshot, including active player, `turnId`, required prefix, deadline, lives, and server time; drives stage focus. |
 | `game_state` | Updated complete match snapshot without requiring a new turn. |
 | `player_typing` | `{ code, gameId, turnId, playerId, text }` for the active player's speech bubble. |

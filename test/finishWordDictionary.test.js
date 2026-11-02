@@ -24,6 +24,10 @@ test("imports lowercase unique words and uses an indexed single-column table", (
     assert.equal(dictionary.isValidWord("APPLE"), true);
     assert.equal(dictionary.isValidWord(" elephant "), true);
     assert.equal(dictionary.isValidWord("elephants"), false);
+    assert.deepEqual(dictionary.getStartingPrefixes(1).sort(), ["a", "e", "t"]);
+    assert.deepEqual(dictionary.getStartingPrefixes(2).sort(), ["ap", "el", "tu"]);
+    const prefixes = dictionary.getStartingPrefixes(1); prefixes.pop();
+    assert.equal(dictionary.getStartingPrefixes(1).length, 3, "prefix snapshots cannot mutate the cache");
     for (const invalid of [null, {}, "", "app", "apple' OR 1=1--", "two words"]) assert.equal(dictionary.isValidWord(invalid), false);
     const database = new Database(options.databasePath, { readonly: true });
     try {

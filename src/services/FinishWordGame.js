@@ -8,9 +8,9 @@ const MAX_WORD_LENGTH = 64;
 // The transport owns room membership, pause state and scheduling. This engine
 // owns every rule and deadline, so a client can never award itself a word/life.
 class FinishWordGame {
-  constructor({ isValidWord, now = Date.now, randomLetter = () => String.fromCharCode(97 + randomInt(26)), randomPlayerIndex = randomInt } = {}) {
+  constructor({ isValidWord, now = Date.now, randomLetter = () => String.fromCharCode(97 + randomInt(26)), randomPlayerIndex = randomInt, getStartingPrefixes } = {}) {
     if (typeof isValidWord !== "function") throw new TypeError("Provide an SQLite-backed isValidWord function.");
-    Object.assign(this, { isValidWord, now, randomLetter, randomPlayerIndex });
+    Object.assign(this, { isValidWord, now, randomLetter, randomPlayerIndex, getStartingPrefixes });
   }
 
   start(players, { turnDuration = TURN_DURATION_SECONDS, hardModeAfter = HARD_MODE_AFTER } = {}) {
@@ -30,7 +30,7 @@ class FinishWordGame {
       }),
       currentTurnIndex: firstPlayer, turnId: null, turnDuration, turnEndsAt: null,
       lastWord: null, requiredPrefix: letter, usedWordsSet: new Set(),
-      successfulTurns: 0, hardModeAfter, typingText: "", history: [],
+      successfulTurns: 0, hardModeAfter, typingText: "", history: [], failedPlayerIds: new Set(),
       winnerId: null, winnerName: null,
     };
     this.beginTurn(game);
@@ -81,14 +81,18 @@ class FinishWordGame {
     }
     // A rejected attempt leaves the turn and its original deadline intact.
     // Only running out of time costs a life.
-    if (reason) return { accepted: false, retryable: true, reason, message,
-      word: word.slice(0, MAX_WORD_LENGTH), playerId: player.id,
-      eliminatedPlayerIds: [], gameOver: false };
+    if (reason) {
+      game.typingText = "";
+      return { accepted: false, retryable: true, reason, message,
+        word: word.slice(0, MAX_WORD_LENGTH), playerId: player.id,
+        eliminatedPlayerIds: [], gameOver: false };
+    }
 
     const requiredPrefix = game.requiredPrefix;
     game.usedWordsSet.add(word);
     game.lastWord = word;
     game.successfulTurns += 1;
+    game.failedPlayerIds.clear();
     game.requiredPrefix = word.slice(game.successfulTurns >= game.hardModeAfter ? -2 : -1);
     const outcome = { accepted: true, reason: "accepted", message: `${player.username} played ${word.toUpperCase()}.`, word,
       playerId, eliminatedPlayerIds: [], gameOver: false };
@@ -141,7 +145,21 @@ class FinishWordGame {
       eliminatedPlayerIds: player.isAlive ? [] : [player.id], gameOver: false };
     this.record(game, player, outcome, game.requiredPrefix);
     if (this.finishIfWinner(game)) outcome.gameOver = true;
-    else this.advanceTurn(game);
+    else {
+      game.failedPlayerIds.add(player.id);
+      if (game.players.filter((candidate) => candidate.isAlive).every((candidate) => game.failedPlayerIds.has(candidate.id))) {
+        const length = game.successfulTurns >= game.hardModeAfter ? 2 : 1;
+        const choices = this.getStartingPrefixes?.(length).filter((prefix) => prefix !== game.requiredPrefix);
+        let prefix = choices?.length ? choices[randomInt(choices.length)] : Array.from({ length }, () => this.randomLetter()).join("").toLowerCase();
+        if (prefix === game.requiredPrefix) prefix = prefix.slice(0, -1) + String.fromCharCode(97 + (prefix.charCodeAt(length - 1) - 96) % 26);
+        game.requiredPrefix = prefix;
+        game.lastWord = null;
+        game.failedPlayerIds.clear();
+        outcome.prefixChanged = true;
+        outcome.message += ` Nobody found a word. Start with ${prefix.toUpperCase()} now.`;
+      }
+      this.advanceTurn(game);
+    }
     return outcome;
   }
 
