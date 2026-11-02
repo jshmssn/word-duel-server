@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const { io: client } = require("socket.io-client");
 process.env.WORD_CHAIN_DB_PATH = ":memory:";
 process.env.RECONNECT_GRACE_MS = "600";
+process.env.RECONNECT_KICK_DELAY_MS = "150";
 const { server, io } = require("../index");
 let url;
 test.before(async () => {
@@ -18,11 +19,14 @@ function next(socket, event, timeout = 4000) {
     socket.once(event, listener);
   });
 }
-async function connect(t) {
-  const socket = client(url, { transports: ["websocket"], forceNew: true, reconnection: false });
+async function connect(t, options = {}) {
+  const socket = client(url, { transports: ["websocket"], forceNew: true, reconnection: false, ...options });
   socket.on("room-session", (session) => { socket.session = session; });
+  if (options.auth?.session) socket.restoration = next(socket, "room-restored");
   t.after(() => socket.disconnect());
-  await next(socket, "connect");
+  const connected = next(socket, "connect");
+  if (options.autoConnect === false) socket.connect();
+  await connected;
   return socket;
 }
 const ack = (socket, event, payload) => socket.timeout(4000).emitWithAck(event, payload);
@@ -107,16 +111,196 @@ test("pending Word Duel questions remain answerable after reconnecting to a new 
   assert.equal((await answered).askerId, asker.id);
 });
 
-test("expired seats cancel the round for everyone; invalid or expired credentials cannot rejoin", async (t) => {
-  const { room, host, guest } = await roomFor(t, "color-card");
+test("waiting seats expire without a room pause; expired credentials cannot rejoin", async (t) => {
+  const host = await connect(t), guest = await connect(t);
+  const room = await ack(host, "CREATE_ROOM", { username: "Host", gameMode: "color-card" });
+  const joined = next(guest, "room-joined");
+  guest.emit("join-room", { code: room.code, username: "Guest" }); await joined;
   const session = host.session;
-  const paused = next(guest, "ROOM_PAUSED");
+  let pauseCount = 0;
+  guest.on("ROOM_PAUSED", () => pauseCount++);
+  const presence = next(guest, "ready-update");
   const lobby = next(guest, "rematch-lobby");
-  host.io.engine.close(); await paused;
+  host.io.engine.close();
+  assert.equal((await presence).players.find((player) => player.id === session.playerId).connectionStatus, "reconnecting");
   const state = await lobby;
+  assert.equal(pauseCount, 0);
+  assert.equal(state.pausedAt, null);
   assert.equal(state.players.length, 1);
   assert.equal(state.creatorId, guest.id);
   const outsider = await connect(t);
   assert.equal((await ack(outsider, "resume-room", { ...session, token: "wrong" })).success, false);
   assert.equal((await ack(outsider, "resume-room", session)).success, false);
+});
+
+test("handshake credentials restore the same seat in a full lobby across repeated app switches", async (t) => {
+  let host = await connect(t);
+  const guest = await connect(t);
+  const room = await ack(host, "CREATE_ROOM", { username: "Host" });
+  const session = host.session;
+  const joined = next(guest, "room-joined");
+  guest.emit("join-room", { code: room.code, username: "Guest" }); await joined;
+  for (let index = 0; index < 3; index++) {
+    const presence = next(guest, "ready-update");
+    host.io.engine.close(); await presence;
+    // Register the snapshot listener before opening the transport.
+    host = await connect(t, { auth: { session }, autoConnect: false });
+    const snapshot = await host.restoration;
+    assert.equal(snapshot.players.length, 2);
+    assert.equal(snapshot.playerId, session.playerId);
+    assert.equal(snapshot.creatorId, session.playerId);
+    assert.ok(snapshot.players.every((player) => player.connected));
+    assert.notEqual(host.id, session.playerId);
+  }
+});
+
+test("an authenticated join restores a reserved slot before the room-full check", async (t) => {
+  const { room, host, guest } = await roomFor(t, "color-card");
+  const session = host.session;
+  const paused = next(guest, "ROOM_PAUSED");
+  host.disconnect(); await paused;
+  const recovered = await connect(t);
+  const restored = next(recovered, "room-restored");
+  recovered.emit("JOIN_ROOM", { code: room.code, username: "Host", session });
+  const state = await restored;
+  assert.equal(state.players.length, 2);
+  assert.equal(state.playerId, session.playerId);
+  assert.equal(state.screen, "game");
+});
+
+async function kickRoom(t, gameMode, count = 4) {
+  const host = await connect(t);
+  const room = await ack(host, "CREATE_ROOM", { username: "Host", gameMode, maxPlayers: count });
+  const sockets = [host];
+  for (let index = 1; index < count; index++) {
+    const socket = await connect(t);
+    const joined = next(socket, "room-joined");
+    socket.emit("JOIN_ROOM", { code: room.code, username: `Player ${index}` }); await joined;
+    sockets.push(socket);
+  }
+  for (const socket of sockets) {
+    const ready = next(host, "ready-update"); socket.emit("toggle-ready", { code: room.code }); await ready;
+  }
+  const started = next(host, gameMode === "color-card" ? "START_GAME" : "category-selected");
+  await ack(host, "START_GAME", { code: room.code });
+  let state = await started;
+  if (gameMode === "word-duel") {
+    const playing = next(host, "game-start");
+    for (const socket of sockets) socket.emit("slot-machine-done", { code: room.code });
+    state = await playing;
+  }
+  return { room, sockets, state };
+}
+
+function openKickVote(socket) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { socket.off("ROOM_KICK_VOTES", listen); reject(new Error("No kick vote")); }, 4000);
+    function listen(data) {
+      if (!data.kickVotes.length) return;
+      clearTimeout(timer); socket.off("ROOM_KICK_VOTES", listen); resolve(data.kickVotes[0]);
+    }
+    socket.on("ROOM_KICK_VOTES", listen);
+  });
+}
+
+for (const gameMode of ["color-card", "word-duel"]) {
+  test(`${gameMode}: kick voting waits for eligibility, requires an active majority and continues the same game`, async (t) => {
+    const { room, sockets, state } = await kickRoom(t, gameMode);
+    const [target, first, second, third] = sockets;
+    const session = target.session;
+    const paused = next(first, "ROOM_PAUSED"), opened = openKickVote(first);
+    target.emit("suspend-room", { code: room.code });
+    const pause = await paused;
+    assert.equal(pause.players.filter((player) => player.connected).length, 3);
+    assert.equal(pause.kickVotes.length, 0);
+    const payload = { code: room.code, playerId: session.playerId, choice: "yes" };
+    assert.equal((await ack(first, "VOTE_ROOM_KICK", { ...payload, voteId: "early" })).success, false);
+    const vote = await opened;
+    assert.equal(vote.totalPlayers, 3); assert.equal(vote.requiredYes, 2);
+    payload.voteId = vote.id;
+    assert.equal((await ack(target, "VOTE_ROOM_KICK", payload)).success, false);
+    const outsider = await connect(t);
+    assert.equal((await ack(outsider, "VOTE_ROOM_KICK", payload)).success, false);
+    const tally = next(third, "ROOM_KICK_VOTES");
+    assert.equal((await ack(first, "VOTE_ROOM_KICK", payload)).success, true);
+    assert.equal((await tally).kickVotes[0].yesPlayerIds.length, 1);
+    assert.equal((await ack(first, "VOTE_ROOM_KICK", payload)).success, false);
+    const restored = next(third, "room-restored"), resumed = next(third, "ROOM_RESUMED");
+    assert.equal((await ack(second, "VOTE_ROOM_KICK", payload)).success, true);
+    await resumed;
+    const snapshot = await restored;
+    assert.equal(snapshot.screen, "game"); assert.equal(snapshot.pausedAt, null);
+    assert.equal(snapshot.players.length, 3); assert.ok(snapshot.players.every((player) => player.connected));
+    assert.equal(snapshot.creatorId, first.session.playerId);
+    if (gameMode === "color-card") {
+      assert.equal(snapshot.gameState.roundId, state.roundId);
+      assert.equal(snapshot.gameState.matchId, state.matchId);
+    } else {
+      assert.equal(snapshot.gameState.category, state.category);
+      assert.notEqual(snapshot.gameState.currentTurn, session.playerId);
+    }
+    assert.equal((await ack(target, "resume-room", session)).success, false);
+  });
+}
+
+test("returning after a kick vote opens cancels the vote and preserves the session beyond the waiting-room expiry", async (t) => {
+  const { room, host, guest } = await roomFor(t, "color-card");
+  const opened = openKickVote(guest);
+  host.emit("suspend-room", { code: room.code });
+  const vote = await opened;
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  const restored = next(host, "room-restored");
+  assert.equal((await ack(host, "resume-room", host.session)).success, true);
+  assert.equal((await restored).kickVotes.length, 0);
+  assert.equal((await ack(guest, "VOTE_ROOM_KICK", { code: room.code, playerId: host.session.playerId, voteId: vote.id, choice: "yes" })).success, false);
+});
+
+for (const gameMode of ["color-card", "word-duel"]) {
+  test(`${gameMode}: the sole active player can remove a reconnecting opponent`, async (t) => {
+    const { room, sockets, state } = await kickRoom(t, gameMode, 2);
+    const [target, active] = sockets;
+    const opened = openKickVote(active);
+    target.emit("suspend-room", { code: room.code });
+    const vote = await opened;
+    assert.equal(vote.requiredYes, 1);
+    const restored = next(active, "room-restored");
+    assert.equal((await ack(active, "VOTE_ROOM_KICK", { code: room.code, playerId: target.session.playerId, voteId: vote.id, choice: "yes" })).success, true);
+    const snapshot = await restored;
+    assert.equal(snapshot.pausedAt, null);
+    assert.equal(snapshot.players.length, 1);
+    if (gameMode === "color-card") {
+      assert.equal(snapshot.gameState.roundId, state.roundId);
+      assert.equal(snapshot.screen, "game");
+    } else {
+      assert.equal(snapshot.screen, "gameover");
+      assert.equal(snapshot.result.winnerId, active.session.playerId);
+    }
+  });
+}
+
+test("multiple reconnecting players have separate votes and the game stays paused until both are resolved", async (t) => {
+  const { room, sockets } = await kickRoom(t, "color-card");
+  const [firstTarget, firstVoter, secondVoter, secondTarget] = sockets;
+  const opened = new Promise((resolve) => {
+    function listen(data) {
+      if (data.kickVotes.length !== 2) return;
+      firstVoter.off("ROOM_KICK_VOTES", listen); resolve(data.kickVotes);
+    }
+    firstVoter.on("ROOM_KICK_VOTES", listen);
+  });
+  firstTarget.emit("suspend-room", { code: room.code });
+  secondTarget.emit("suspend-room", { code: room.code });
+  const votes = await opened;
+  let resumed = 0;
+  firstVoter.on("ROOM_RESUMED", () => resumed++);
+  for (const [index, vote] of votes.entries()) {
+    assert.equal(vote.requiredYes, 2);
+    const payload = { code: room.code, playerId: vote.playerId, voteId: vote.id, choice: "yes" };
+    await ack(firstVoter, "VOTE_ROOM_KICK", payload);
+    const restored = next(firstVoter, "room-restored");
+    await ack(secondVoter, "VOTE_ROOM_KICK", payload);
+    const snapshot = await restored;
+    assert.equal(Boolean(snapshot.pausedAt), index === 0);
+    assert.equal(resumed, index);
+  }
 });

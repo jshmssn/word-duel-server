@@ -94,6 +94,35 @@ class ColorCardRounds {
     this.schedule(room);
   }
 
+  removePlayer(room, playerId) {
+    const keep = (player) => player.id !== playerId;
+    const round = room.colorRound;
+    if (!round) return;
+    round.players = round.players.filter(keep);
+    for (const collection of [round.drafts, round.submissions, round.submittedAt, round.skipVote?.votes]) collection?.delete(playerId);
+    round.autoSubmittedIds.delete(playerId);
+    if (room.colorMatch) room.colorMatch.players = room.colorMatch.players.filter(keep);
+    const updateResult = (result) => {
+      if (!result) return;
+      result.entries = result.entries.filter(keep);
+      const best = result.entries.find((entry) => entry.distance !== null)?.distance;
+      result.winners = result.entries.filter((entry) => entry.distance !== null && entry.distance === best).map(({ id, username }) => ({ id, username }));
+      result.winnerIds = result.winners.map((player) => player.id);
+    };
+    updateResult(round.result);
+    updateResult(room.colorRanking);
+    if (room.colorRanking) {
+      const ranking = room.colorRanking;
+      ranking.players = this.publicPlayers(room);
+      ranking.standings = ranking.standings.filter(keep);
+      const best = ranking.standings.find((player) => player.submittedCards > 0)?.totalAccuracy;
+      ranking.matchWinnerIds = ranking.matchComplete ? ranking.standings.filter((player) => player.submittedCards > 0 && player.totalAccuracy === best).map((player) => player.id) : [];
+    }
+    // Removing a voter changes the majority. Cancel the old poll rather than
+    // allowing a removed player's vote to decide the remaining players' card.
+    if (round.skipVote?.status === "active") this.closeVote(room, "cancelled");
+  }
+
   beginPicking(room, roundId) {
     const round = room.colorRound;
     if (this.rooms[room.code] !== room || room.state !== "playing" || round?.id !== roundId || round.phase === "picking") return;

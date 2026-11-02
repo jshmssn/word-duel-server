@@ -13,11 +13,14 @@ test.before(async () => {
 });
 test.after(async () => { await new Promise((resolve) => io.close(resolve)); });
 
-function next(socket, event, timeout = 4000) {
+function next(socket, event, timeout = 4000, accepts = () => true) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { socket.off(event, handler); reject(new Error(`Timed out waiting for ${event}`)); }, timeout);
-    function handler(data) { clearTimeout(timer); resolve(data); }
-    socket.once(event, handler);
+    function handler(data) {
+      if (!accepts(data)) return;
+      clearTimeout(timer); socket.off(event, handler); resolve(data);
+    }
+    socket.on(event, handler);
   });
 }
 
@@ -111,13 +114,13 @@ test("Color Card previous-match averages survive rematches, then reset after a d
   const restored = next(host, "room-restored");
   assert.equal((await ack(host, "resume-room", session)).success, true);
   assert.ok((await restored).players.every((player) => player.previousMatchAverageAccuracy === 100));
-  const backgrounded = next(guest, "ROOM_PAUSED");
+  const backgrounded = next(guest, "ready-update", 4000, (state) => state.players.some((player) => player.connected === false));
   host.emit("suspend-room", { code: room.code });
   assert.ok((await backgrounded).players.every((player) => player.previousMatchAverageAccuracy === 100));
   const foregrounded = next(host, "room-restored");
   await ack(host, "resume-room", session);
   assert.ok((await foregrounded).players.every((player) => player.previousMatchAverageAccuracy === 100));
-  const paused = next(guest, "ROOM_PAUSED");
+  const paused = next(guest, "ready-update", 4000, (state) => state.players.some((player) => player.connected === false));
   host.io.engine.close();
   assert.ok((await paused).players.every((player) => player.previousMatchAverageAccuracy === 0 && player.previousMatchCardCount === 0));
   const recovered = await connect(t);
@@ -252,16 +255,15 @@ test("Color Card shares targets and lets every player edit after everyone submit
   }
 });
 
-test("Color Card cancels its timer and returns players to the lobby on disconnect", async (t) => {
+test("Color Card preserves its round and pauses on a client disconnect", async (t) => {
   const room = await makeRoom(t, 3);
   await startColor(room);
-  const lobby = next(room.sockets[1], "rematch-lobby");
+  const paused = next(room.sockets[1], "ROOM_PAUSED");
   room.host.disconnect();
-  const state = await lobby;
-  assert.equal(state.creatorId, room.sockets[1].id);
-  assert.equal(state.players.length, 2);
-  assert.ok(state.players.every((player) => !player.ready));
-  assert.match(state.message, /cancelled/);
+  const state = await paused;
+  assert.equal(state.players.length, 3);
+  assert.equal(state.players.find((player) => player.id === room.host.session.playerId).connectionStatus, "reconnecting");
+  assert.ok(state.pausedAt);
 });
 
 test("readying Color Card starts its round automatically without word category roulette", { timeout: 12000 }, async (t) => {

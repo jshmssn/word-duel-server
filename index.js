@@ -5,6 +5,7 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const { randomUUID } = require("node:crypto");
 const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS) || 90_000;
+const RECONNECT_KICK_DELAY_MS = Number(process.env.RECONNECT_KICK_DELAY_MS) || 45_000;
 const wordsData = require("./words.json");
 const { roomOptions } = require("./src/config/gameModes");
 const { ColorCardRounds } = require("./src/socket/ColorCardSocket");
@@ -96,6 +97,7 @@ function lobbyState(room) {
     colorDuration: room.colorDuration,
     colorCardCount: room.colorCardCount,
     pausedAt: room.pausedAt || null,
+    kickVotes: publicKickVotes(room),
   };
 }
 
@@ -293,6 +295,8 @@ function publicPlayers(room) {
     wins: p.wins || 0,
     isBot: Boolean(p.isBot),
     connected: p.connected !== false,
+    connectionStatus: p.connected !== false ? "connected" : "reconnecting",
+    kickEligibleAt: p.kickEligibleAt || null,
     ...(room.gameMode === "color-card" && room.state === "waiting" ? {
       previousMatchAverageAccuracy: p.previousMatchAverageAccuracy || 0,
       previousMatchCardCount: p.previousMatchCardCount || 0,
@@ -447,6 +451,7 @@ function createRoomState(code, creatorId, username, { withBot = false, gameMode 
     pendingLetterAsk: null,
     pendingLetterCount: null,
     pausedAt: null,
+    kickVotes: new Map(),
     askedLetters: {},
   };
 }
@@ -461,6 +466,11 @@ function attachRoomSession(socket, room, player) {
   player.sessionToken ||= randomUUID();
   clearTimeout(player.reconnectTimer);
   player.reconnectTimer = null;
+  clearTimeout(player.kickTimer);
+  player.kickTimer = null;
+  player.kickEligibleAt = null;
+  player.reconnectExpiresAt = null;
+  room.kickVotes.delete(player.id);
   socket.emit("room-session", { code: room.code, playerId: player.id, token: player.sessionToken });
 }
 
@@ -496,6 +506,11 @@ function sendRoomSnapshots(room) {
 }
 
 function pauseRoom(room, player) {
+  if (room.state === "waiting") {
+    clearCountdown(room.code);
+    broadcastReadyState(room.code);
+    return;
+  }
   if (!room.pausedAt) {
     room.pausedAt = Date.now();
     clearCountdown(room.code);
@@ -506,6 +521,7 @@ function pauseRoom(room, player) {
   io.to(room.code).emit("ROOM_PAUSED", {
     code: room.code, players: publicPlayers(room), pausedAt: room.pausedAt,
     serverNow: Date.now(), expiresAt: player.reconnectExpiresAt,
+    kickVotes: publicKickVotes(room),
     message: `${player.username} is reconnecting. The room and timers are paused.`,
   });
 }
@@ -521,7 +537,7 @@ function resumeRoom(room) {
       scheduleBotTurnIfNeeded(room.code);
     }
   } else if (room.state === "waiting" && roomReadyToStart(room)) startCountdown(room.code);
-  io.to(room.code).emit("ROOM_RESUMED", { code: room.code, players: publicPlayers(room), message: "Everyone is back. The room has resumed!" });
+  io.to(room.code).emit("ROOM_RESUMED", { code: room.code, players: publicPlayers(room), message: "The remaining players are connected. The game has resumed!" });
   sendRoomSnapshots(room);
   if (room.state === "slotting") io.to(room.code).emit("category-selected", { category: room.category, selectedCategoryName: room.category });
 }
@@ -534,14 +550,111 @@ function reserveSeat(room, player, socket, disconnected = false) {
   }
   player.connected = false;
   player.reconnectExpiresAt = Date.now() + RECONNECT_GRACE_MS;
+  player.kickEligibleAt = Date.now() + RECONNECT_KICK_DELAY_MS;
   pauseRoom(room, player);
+  player.kickTimer = setTimeout(() => {
+    if (rooms[room.code] !== room || player.connected !== false || !room.pausedAt) return;
+    room.kickVotes.set(player.id, { id: randomUUID(), votes: new Map() });
+    publishKickVotes(room);
+  }, RECONNECT_KICK_DELAY_MS);
+  player.kickTimer.unref();
   player.reconnectTimer = setTimeout(() => {
-    if (rooms[room.code] === room && player.connected === false) {
-      // An app may remain connected while backgrounded; release that seat too.
+    if (rooms[room.code] === room && player.connected === false &&
+        (room.state === "waiting" || !getHumanPlayers(room).some((candidate) => candidate.connected !== false))) {
       leaveRoom(socket, true);
     }
   }, RECONNECT_GRACE_MS);
   player.reconnectTimer.unref();
+  if (room.pausedAt) publishKickVotes(room);
+}
+
+function publicKickVotes(room) {
+  const activeIds = new Set(getHumanPlayers(room).filter((player) => player.connected !== false).map((player) => player.id));
+  return [...room.kickVotes].filter(([id]) => room.players.some((player) => player.id === id && player.connected === false))
+    .map(([playerId, vote]) => ({
+      id: vote.id, playerId, totalPlayers: activeIds.size, requiredYes: Math.floor(activeIds.size / 2) + 1,
+      yesPlayerIds: [...vote.votes].filter(([id, choice]) => activeIds.has(id) && choice === "yes").map(([id]) => id),
+      noPlayerIds: [...vote.votes].filter(([id, choice]) => activeIds.has(id) && choice === "no").map(([id]) => id),
+    }));
+}
+
+function publishKickVotes(room) {
+  const kickVotes = publicKickVotes(room);
+  const passed = kickVotes.find((vote) => vote.totalPlayers > 0 && vote.yesPlayerIds.length >= vote.requiredYes);
+  if (passed) { kickReconnectingPlayer(room, passed.playerId); return; }
+  io.to(room.code).emit("ROOM_KICK_VOTES", { code: room.code, players: publicPlayers(room), kickVotes, serverNow: Date.now() });
+}
+
+function restoreRoomSession(socket, session) {
+  const room = rooms[session?.code];
+  const player = room?.players.find((candidate) => candidate.id === session?.playerId && candidate.sessionToken && candidate.sessionToken === session?.token);
+  if (!player || (player.connected === false && room.state === "waiting" && Date.now() >= player.reconnectExpiresAt)) {
+    throw new Error("Your room reservation expired. Join a room to play again.");
+  }
+  if (socket.data.lobbyCode && (socket.data.lobbyCode !== room.code || lobbyPlayerId(socket) !== player.id)) throw new Error("You are already in another room.");
+  const previousSocket = io.sockets.sockets.get(player.socketId);
+  attachRoomSession(socket, room, player);
+  if (previousSocket && previousSocket !== socket) {
+    previousSocket.leave(room.code);
+    previousSocket.leave(player.id);
+    previousSocket.data.lobbyCode = null;
+    previousSocket.disconnect(true);
+  }
+  broadcastReadyState(room.code);
+  if (room.pausedAt && !room.players.some((candidate) => candidate.connected === false)) resumeRoom(room);
+  else {
+    socket.emit("room-restored", personalRoomState(room, player.id));
+    if (room.pausedAt) publishKickVotes(room);
+    else if (room.state === "waiting" && roomReadyToStart(room)) startCountdown(room.code);
+  }
+}
+
+function kickReconnectingPlayer(room, playerId) {
+  const index = room.players.findIndex((player) => player.id === playerId && player.connected === false);
+  if (index < 0) return;
+  const oldPlayers = [...room.players];
+  const [player] = room.players.splice(index, 1);
+  clearTimeout(player.reconnectTimer);
+  clearTimeout(player.kickTimer);
+  room.kickVotes.delete(playerId);
+  const previousSocket = io.sockets.sockets.get(player.socketId);
+  if (previousSocket) {
+    previousSocket.emit("room-kicked", { code: room.code, message: "The active players voted to remove you while you were reconnecting." });
+    previousSocket.leave(room.code); previousSocket.leave(playerId);
+    previousSocket.data.lobbyCode = null;
+  }
+  if (room.creatorId === playerId) room.creatorId = getHumanPlayers(room)[0]?.id || room.players[0]?.id;
+  if (room.gameMode === "color-card") colorCardRounds.removePlayer(room, playerId);
+  else {
+    // The next player in lobby order becomes the new target. Knowledge about
+    // the removed target must not carry over to a different secret word.
+    oldPlayers.forEach((candidate, position) => {
+      if (oldPlayers[(position + 1) % oldPlayers.length]?.id === playerId) {
+        room.confirmedLetters[candidate.id] = {};
+        room.askedLetters[candidate.id] = {};
+      }
+    });
+    room.pendingLetterAsk = null; room.pendingLetterCount = null;
+    if (room.currentTurn === playerId) {
+      room.currentTurn = room.players[index % room.players.length]?.id;
+      room.turnRemaining = room.turnDuration;
+    }
+    if (room.state === "playing" && room.players.length === 1) {
+      const winner = room.players[0];
+      winner.wins = (winner.wins || 0) + 1;
+      room.state = "ended";
+      const seriesState = getSeriesState(room, winner.id);
+      room.seriesOver = seriesState.seriesOver;
+      room.lastResult = { winnerId: winner.id, winnerName: winner.username, winnerWins: winner.wins,
+        players: publicPlayers(room), wordsByPlayer: { ...room.words }, ...seriesState };
+      io.to(room.code).emit("game-over", room.lastResult);
+    }
+  }
+  const message = `${player.username} was removed by a majority vote.`;
+  io.to(room.code).emit("player-left", { code: room.code, playerId, username: player.username, message });
+  if (room.players.some((candidate) => candidate.connected === false)) {
+    publishKickVotes(room); sendRoomSnapshots(room);
+  } else resumeRoom(room);
 }
 
 // Explicit quits and expired reconnection reservations release room resources.
@@ -556,6 +669,8 @@ function leaveRoom(socket, disconnected = false) {
   const [left] = room.players.splice(index, 1);
   colorCardRounds.resetPreviousMatch(room);
   clearTimeout(left.reconnectTimer);
+  clearTimeout(left.kickTimer);
+  room.kickVotes.delete(left.id);
   const cancelled = !["waiting", "ended"].includes(room.state);
   socket.leave(code);
   socket.data.lobbyCode = null;
@@ -573,7 +688,8 @@ function leaveRoom(socket, disconnected = false) {
   room.confirmedLetters = {};
   room.pendingCategory = null;
   room.slotDoneIds = null;
-  if (!room.players.some((player) => player.connected === false)) room.pausedAt = null;
+  room.pausedAt = null;
+  room.kickVotes.clear();
 
   const text = `${left.username} ${disconnected ? "disconnected" : "quit the room"}.${cancelled ? " The round was cancelled; ready up to play again." : ""}`;
   const message = { id: Date.now() + Math.random(), system: true, text, timestamp: Date.now() };
@@ -597,7 +713,7 @@ io.on("connection", (socket) => {
   colorCardRounds.register(socket);
   socket.use(([event, , reply], next) => {
     const room = rooms[socket.data.lobbyCode];
-    if (room?.pausedAt && !["resume-room", "suspend-room", "leave-room", "chat-message"].includes(event)) {
+    if (room?.pausedAt && !["resume-room", "suspend-room", "leave-room", "chat-message", "VOTE_ROOM_KICK", "JOIN_ROOM", "join-room"].includes(event)) {
       const response = { success: false, message: "The room is paused while a player reconnects." };
       if (typeof reply === "function") reply(response);
       else socket.emit("room-action-error", response);
@@ -614,16 +730,25 @@ io.on("connection", (socket) => {
 
   socket.on("resume-room", (payload = {}, reply) => {
     try {
-      const room = rooms[payload?.code];
-      const player = room?.players.find((candidate) => candidate.sessionToken && candidate.sessionToken === payload?.token);
-      if (!player || (player.connected === false && Date.now() >= player.reconnectExpiresAt)) throw new Error("Your room reservation expired. Join a room to play again.");
-      if (socket.data.lobbyCode && socket.data.lobbyCode !== room.code) throw new Error("You are already in another room.");
-      const previousSocket = io.sockets.sockets.get(player.socketId);
-      attachRoomSession(socket, room, player);
-      if (previousSocket && previousSocket !== socket) previousSocket.disconnect(true);
-      if (room.pausedAt && !room.players.some((candidate) => candidate.connected === false)) resumeRoom(room);
-      else socket.emit("room-restored", personalRoomState(room, player.id));
+      restoreRoomSession(socket, payload);
       if (typeof reply === "function") reply({ success: true });
+    } catch (error) { if (typeof reply === "function") reply({ success: false, message: error.message }); }
+  });
+
+  socket.on("VOTE_ROOM_KICK", (payload = {}, reply) => {
+    try {
+      const room = rooms[socket.data.lobbyCode];
+      const voter = room?.players.find((player) => player.id === lobbyPlayerId(socket) && player.socketId === socket.id && player.connected !== false);
+      const target = room?.players.find((player) => player.id === payload.playerId && player.connected === false);
+      const vote = room?.kickVotes.get(payload.playerId);
+      if (!voter || room.code !== payload.code || !room.pausedAt || !target || Date.now() < target.kickEligibleAt || vote?.id !== payload.voteId) throw new Error("That kick vote is not available.");
+      if (!["yes", "no"].includes(payload.choice)) throw new Error("Choose Yes or No.");
+      if (vote.votes.has(voter.id)) throw new Error("Your vote has already been counted.");
+      vote.votes.set(voter.id, payload.choice);
+      if (typeof reply === "function") reply({ success: true });
+      const tally = publicKickVotes(room).find((candidate) => candidate.id === vote.id);
+      if (tally.yesPlayerIds.length >= tally.requiredYes) kickReconnectingPlayer(room, target.id);
+      else publishKickVotes(room);
     } catch (error) { if (typeof reply === "function") reply({ success: false, message: error.message }); }
   });
 
@@ -672,6 +797,12 @@ io.on("connection", (socket) => {
   const joinRoom = (payload = {}) => {
     let code, username;
     try {
+      // Authenticate an existing slot before checking capacity or game phase.
+      const session = payload.session || (socket.data.lobbyCode && socket.handshake.auth?.session);
+      if (session?.code === String(payload.code || "").trim().toUpperCase()) {
+        restoreRoomSession(socket, session);
+        return;
+      }
       if (socket.data.lobbyCode) throw new Error("You are already in a room.");
       code = String(payload?.code || "").trim().toUpperCase();
       username = playerName(payload?.username);
@@ -896,9 +1027,13 @@ io.on("connection", (socket) => {
     const room = rooms[socket.data.lobbyCode];
     const player = room?.players.find((candidate) => candidate.id === lobbyPlayerId(socket));
     if (!player || player.socketId !== socket.id) return;
-    if (["client namespace disconnect", "server namespace disconnect", "server shutting down"].includes(reason)) { leaveRoom(socket, true); return; }
     reserveSeat(room, player, socket, true);
   });
+
+  if (socket.handshake.auth?.session) {
+    try { restoreRoomSession(socket, socket.handshake.auth.session); }
+    catch (error) { socket.emit("room-session-error", { message: error.message }); }
+  }
 });
 
 // ─── Game Functions ───────────────────────────────────────────────────────────
