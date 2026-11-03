@@ -46,10 +46,10 @@ Open **http://localhost:5173**. The development client connects to **http://loca
 2. Other players enter their names and join with the room code. Separate browser tabs can be used to test multiple players locally.
 3. Each player selects one of eight characters: Knight, Wizard, Ninja, Robot, Alien, Pirate, Astronaut, or Dino. A chosen character is locked for everyone else immediately. Choosing another character releases the previous one.
 4. Every player, including the host, clicks **Ready up**. Once the room has 2–8 players, all ready, connected and each with a unique character, the shared five-second countdown starts the match automatically after the same two-second settling delay as Word Duel and Color Card. Players can unready; changing characters clears readiness and cancels the countdown. Rematches require everyone to ready up again.
-5. The server randomly chooses the starting letter and first player for each new match. The active player has **15 seconds** and starts with **3 hearts**. Only that player's word input is active and automatically focused.
+5. The server randomly chooses the first player and privately offers **four distinct playable starting letters** on the first turn only. Selecting a letter locks it immediately. The existing **15-second** deadline includes selection and typing; selection does not reset it. Each player starts with **3 hearts**. Small custom dictionaries with fewer than four playable letters offer all available letters.
 6. A submission must contain at least **2 letters**, exist in the imported SQLite dictionary after lowercase normalization, begin with the required prefix, and be unused in the current match. Validation is an exact whole-word lookup, not a prefix vocabulary search.
-7. Accepted words set the next required prefix to their last letter: `APPLE → ELEPHANT → TURTLE`. After **10 accepted words**, hard mode requires the last **two** letters of the previous accepted word instead.
-8. An invalid submission clears the player's input and live typing bubble while preserving hearts, turn and the original deadline. The input shakes (unless reduced motion is enabled) and plays a wrong sound when sound is enabled. The player can correct and resubmit while time remains. Only a timeout costs **one heart and the turn**. The prefix remains in effect until every remaining player times out without an accepted word. The server then chooses a different dictionary-backed prefix of the current one- or two-letter length and clears the previous-word prompt. Hard-mode progress and used words are preserved. A stale or out-of-turn network action returns an error without deducting a heart.
+7. The first **10 accepted words** require one starting letter. Starting with word **11**, each new turn independently draws a **60% chance of two letters** and **40% chance of one**. The preferred prefix is the previous accepted word's last one or two letters. Before assigning it, the server checks for at least one **unused** dictionary word of 2–64 letters starting with it. An impossible or exhausted prefix is replaced with a random playable prefix of the selected length. If no playable words remain at all, the match ends with `endReason: "dictionary_exhausted"` instead of creating an impossible turn.
+8. The client displays the required prefix as immutable text next to an input for the ending. Backspace, Delete, selecting all, pasting, and mobile composition only edit that ending. Pasting a full matching word over the entire ending strips its prefix once. Submissions and live typing contain the complete word; server validation independently enforces its prefix. An invalid attempt clears only the typed ending, preserves hearts and the original deadline, shakes the input unless reduced motion is enabled, and plays a wrong sound when enabled. Only a timeout costs **one heart and the turn**. A full cycle of timeouts forces another playable prefix while preserving accepted-word progress and used words. A stale or out-of-turn action returns an error without deducting a heart.
 9. Players with zero hearts are eliminated and can watch. The last player with hearts remaining wins.
 
 The stage uses eight distinct **2D SVG characters**. Floating nametags and heart counters identify each player. A smooth stage/camera transition focuses on the active character at each turn; reduced-motion preferences are respected. The active player's current typing appears publicly in a speech bubble, so other players can see the live word before submission.
@@ -83,6 +83,7 @@ Room codes are the room IDs. Room actions accept `code`; Finish the Word aliases
 | `select_character` | `{ code, characterId }` | Claims an available character in the lobby; IDs are `knight`, `wizard`, `ninja`, `robot`, `alien`, `pirate`, `astronaut`, `dino`. |
 | `toggle-ready` | `{ code }` | Toggles readiness after choosing a character; broadcasts `ready-update` and starts/cancels the shared automatic countdown. |
 | `start_game` | `{ code }` | Host-only start after all room members are ready, connected and have selected unique characters. |
+| `choose_starting_letter` | `{ code, turnId, letter }` | Only the opening player may choose one of the server's options, once, before the deadline. Broadcasts the locked prefix without resetting the timer. |
 | `player_typing` | `{ code, turnId, text }` | Broadcasts the current active player's sanitized typing to the room. |
 | `submit_word` | `{ code, turnId, word }` | Validates an attempt; accepted words and timeouts resolve the turn, while invalid words allow retries. |
 
@@ -95,6 +96,7 @@ Actions support acknowledgement callbacks. A transport/ownership/stale-turn fail
 | `ready-update` | Current lobby roster/readiness and the player whose readiness changed. |
 | `countdown`, `countdown-cancel` | The shared five-second ready-up countdown or its cancellation. |
 | `turn_start` | Complete new-turn snapshot, including active player, `turnId`, required prefix, deadline, lives, and server time; drives stage focus. |
+| `starting_letter_choices` | Private event to the first player's socket: `{ code, gameId, turnId, playerId, choices }`. Public snapshots expose `awaitingStartingLetterChoice` and an empty choices array. Personal recovery snapshots restore options only for that player. |
 | `game_state` | Updated complete match snapshot without requiring a new turn. |
 | `player_typing` | `{ code, gameId, turnId, playerId, text }` for the active player's speech bubble. |
 | `word_accepted`, `word_rejected` | Attempt outcome with player ID, word/reason/message, and elimination information. Retryable rejections include the unchanged `turnId` and do not broadcast a new turn. |
@@ -102,6 +104,8 @@ Actions support acknowledgement callbacks. A transport/ownership/stale-turn fail
 | `game_over` | Final match snapshot with winner information. |
 
 Clients render the server's state rather than assigning themselves a character, a successful word, extra time, or lives. The server checks room/socket membership and turn ownership before any rule mutation.
+
+`getStartingPrefixes(length, usedWords)` reuses cached dictionary prefix counts and subtracts accepted words, excluding single-character and oversized entries. The `hardMode` state flag means randomized difficulty has unlocked; the current `requiredPrefix.length` identifies this turn's actual requirement. Choices, probability rolls and fallback prefixes are generated only on the server.
 
 ## 5. Sessions, disconnects, and persistence
 

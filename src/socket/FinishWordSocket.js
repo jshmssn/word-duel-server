@@ -8,13 +8,13 @@ class FinishWordRounds {
   constructor({ io, rooms, publicPlayers, dictionary, game, onLobbyChanged }) {
     Object.assign(this, { io, rooms, publicPlayers, dictionary, onLobbyChanged });
     this.game = game || new FinishWordGame({ isValidWord: (word) => dictionary.isValidWord(word),
-      getStartingPrefixes: (length) => dictionary.getStartingPrefixes(length) });
+      getStartingPrefixes: (length, usedWords) => dictionary.getStartingPrefixes(length, usedWords) });
     this.timers = new Map();
     this.typingTimers = new Map();
   }
 
-  state(room) {
-    const state = this.game.publicState(room.finishWordGame);
+  state(room, playerId) {
+    const state = this.game.publicState(room.finishWordGame, playerId);
     const presence = new Map(this.publicPlayers(room).map((player) => [player.id, player]));
     return { ...state, code: room.code, roomId: room.code, creatorId: room.creatorId,
       maxPlayers: room.maxPlayers, pausedAt: room.pausedAt || null,
@@ -22,8 +22,8 @@ class FinishWordRounds {
     };
   }
 
-  snapshot(room) {
-    const state = this.state(room);
+  snapshot(room, playerId) {
+    const state = this.state(room, playerId);
     return state.status === "ENDED" ? { result: state } : { gameState: state };
   }
 
@@ -48,7 +48,16 @@ class FinishWordRounds {
         room.finishWordGame.winnerAwarded = true;
       }
       this.io.to(room.code).emit("game_over", state);
-    } else this.io.to(room.code).emit(newTurn ? "turn_start" : "game_state", state);
+    } else {
+      this.io.to(room.code).emit(newTurn ? "turn_start" : "game_state", state);
+      if (state.awaitingStartingLetterChoice) {
+        const firstPlayer = room.players.find((player) => player.id === state.currentPlayerId);
+        if (firstPlayer?.connected !== false && firstPlayer?.socketId) this.io.to(firstPlayer.socketId).emit("starting_letter_choices", {
+          code: room.code, gameId: state.gameId, turnId: state.turnId, playerId: firstPlayer.id,
+          choices: this.game.publicState(room.finishWordGame, firstPlayer.id).startingLetterChoices,
+        });
+      }
+    }
   }
 
   schedule(room) {
@@ -128,6 +137,16 @@ class FinishWordRounds {
   }
 
   register(socket) {
+    socket.on("choose_starting_letter", (payload = {}, reply) => {
+      try {
+        const { room, player } = this.requirePlayer(socket, payload);
+        if (room.state !== "playing") throw new Error("The match is not accepting a starting letter.");
+        const requiredPrefix = this.game.chooseStartingLetter(room.finishWordGame, { playerId: player.id, turnId: payload.turnId, letter: payload.letter });
+        this.publish(room);
+        if (typeof reply === "function") reply({ success: true, requiredPrefix, turnId: room.finishWordGame.turnId });
+      } catch (error) { if (typeof reply === "function") reply({ success: false, message: error.message }); }
+    });
+
     socket.on("select_character", (payload = {}, reply) => {
       try {
         const { room, player } = this.requirePlayer(socket, payload);

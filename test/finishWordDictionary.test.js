@@ -39,6 +39,17 @@ test("imports lowercase unique words and uses an indexed single-column table", (
   } finally { dictionary.close(); }
 });
 
+test("playable prefix lists exclude used words, single-character entries and oversized words", (t) => {
+  const dictionary = createFinishWordDictionary(fixture(t, `a\napple\nape\nonyx\nstone\nbrave\n${"z".repeat(65)}\n`));
+  try {
+    assert.deepEqual(dictionary.getStartingPrefixes(1).sort(), ["a", "b", "o", "s"]);
+    assert.ok(dictionary.getStartingPrefixes(2, new Set(["apple"])).includes("ap"));
+    assert.ok(!dictionary.getStartingPrefixes(2, new Set(["apple", "ape"])).includes("ap"));
+    assert.deepEqual(dictionary.getStartingPrefixes(1, new Set(["apple", "ape", "onyx", "stone", "brave"])), []);
+    assert.ok(!dictionary.getStartingPrefixes(2).includes("yx"));
+  } finally { dictionary.close(); }
+});
+
 test("unchanged files are idempotent and a changed file atomically replaces old words", (t) => {
   const options = fixture(t);
   let dictionary = createFinishWordDictionary(options);

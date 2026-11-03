@@ -99,14 +99,24 @@ function createFinishWordDictionary(options = {}) {
       importResult = { imported: false, count, sourceSha256: seeded.value };
     }
     const findWord = database.prepare("SELECT 1 FROM words WHERE word = ? LIMIT 1");
-    const prefixes = new Map([1, 2].map((length) => [length,
-      database.prepare("SELECT DISTINCT substr(word, 1, ?) AS prefix FROM words WHERE length(word) >= 2").all(length).map((row) => row.prefix),
-    ]));
+    const prefixCounts = new Map([1, 2].map((length) => [length, new Map(
+      database.prepare("SELECT substr(word, 1, ?) AS prefix, COUNT(*) AS count FROM words WHERE length(word) BETWEEN 2 AND 64 GROUP BY prefix")
+        .all(length).map((row) => [row.prefix, row.count]),
+    )]));
     return {
       ...importResult,
       filePath,
       databasePath,
-      getStartingPrefixes(length) { return [...(prefixes.get(length) || [])]; },
+      getStartingPrefixes(length, usedWords = new Set()) {
+        const counts = prefixCounts.get(length);
+        if (!counts) return [];
+        const usedCounts = new Map();
+        for (const word of usedWords) {
+          const prefix = word.slice(0, length);
+          usedCounts.set(prefix, (usedCounts.get(prefix) || 0) + 1);
+        }
+        return [...counts].filter(([prefix, count]) => count > (usedCounts.get(prefix) || 0)).map(([prefix]) => prefix);
+      },
       isValidWord(word) {
         const normalized = normalizeWord(word);
         return /^[a-z]+$/.test(normalized) && Boolean(findWord.get(normalized));

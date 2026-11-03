@@ -495,7 +495,7 @@ function attachRoomSession(socket, room, player) {
 function personalRoomState(room, playerId) {
   let state = {};
   if (room.gameMode === "color-card" && room.colorRound) state = colorCardRounds.snapshot(room, playerId);
-  else if (room.gameMode === "finish-word" && room.finishWordGame) state = finishWordRounds.snapshot(room);
+  else if (room.gameMode === "finish-word" && room.finishWordGame) state = finishWordRounds.snapshot(room, playerId);
   else if (room.state === "playing") {
     const opponent = getOpponent(room, playerId);
     const prompt = (pending) => pending && getOpponent(room, pending.askerId)?.id === playerId

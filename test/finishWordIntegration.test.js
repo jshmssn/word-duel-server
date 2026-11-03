@@ -59,7 +59,14 @@ async function makeRoom(t, { count = 2, start = true } = {}) {
   for (const socket of sockets) assert.equal((await ack(socket, "toggle-ready", { code: room.code })).ready, true);
   const started = next(host, "turn_start");
   assert.equal((await ack(host, "start_game", { roomId: room.code })).success, true);
-  return { room, sockets, host, state: await started };
+  const initial = await started;
+  const first = sockets.find((socket) => socket.session.playerId === initial.currentPlayerId);
+  const snapshot = next(first, "room-restored");
+  await ack(first, "resume-room", first.session);
+  const choices = (await snapshot).gameState.startingLetterChoices;
+  const chosen = next(host, "game_state");
+  assert.equal((await ack(first, "choose_starting_letter", { code: room.code, turnId: initial.turnId, letter: choices[0] })).success, true);
+  return { room, sockets, host, state: await chosen };
 }
 
 test("character ownership, explicit ready toggles and host-only ready starts work on real sockets", async (t) => {
@@ -129,6 +136,51 @@ test("real typing and word submissions validate the SQLite source and broadcast 
   assert.equal(remaining.players.find((player) => player.id === guest.session.playerId).lives, 3);
   assert.equal(remaining.currentPlayerId, host.session.playerId);
   assert.deepEqual(remaining.usedWords, [word, nextWord]);
+});
+
+test("real multiplayer opening choices are private, survive recovery and cannot be selected by an opponent", async (t) => {
+  const { room, sockets, host } = await makeRoom(t, { count: 3, start: false });
+  const deliveries = [];
+  for (const [index, socket] of sockets.entries()) {
+    socket.on("starting_letter_choices", (data) => deliveries.push({ playerId: socket.session.playerId, ...data }));
+    await ack(socket, "select_character", { code: room.code, characterId: ["knight", "wizard", "ninja"][index] });
+    await ack(socket, "toggle-ready", { code: room.code });
+  }
+  const started = next(host, "turn_start");
+  await ack(host, "start_game", { code: room.code });
+  const initial = await started;
+  assert.equal(initial.awaitingStartingLetterChoice, true);
+  assert.deepEqual(initial.startingLetterChoices, []);
+  assert.equal(initial.requiredPrefix, null);
+  const first = sockets.find((socket) => socket.session.playerId === initial.currentPlayerId);
+  const snapshot = next(first, "room-restored");
+  await ack(first, "resume-room", first.session);
+  const restored = (await snapshot).gameState;
+  assert.equal(new Set(restored.startingLetterChoices).size, 4);
+  assert.ok(restored.startingLetterChoices.every((prefix) => dictionary.some((word) => word.startsWith(prefix))));
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].playerId, first.session.playerId);
+  for (const other of sockets.filter((socket) => socket !== first)) {
+    assert.equal((await ack(other, "choose_starting_letter", { code: room.code, turnId: initial.turnId, letter: restored.startingLetterChoices[0] })).success, false);
+    const personal = next(other, "room-restored");
+    await ack(other, "resume-room", other.session);
+    assert.deepEqual((await personal).gameState.startingLetterChoices, []);
+  }
+  const chosen = next(host, "game_state");
+  const letter = restored.startingLetterChoices[0];
+  assert.equal((await ack(first, "choose_starting_letter", { code: room.code, turnId: initial.turnId, letter })).success, true);
+  const state = await chosen;
+  assert.equal(state.requiredPrefix, letter);
+  assert.equal(state.turnEndsAt, initial.turnEndsAt);
+  assert.equal(state.awaitingStartingLetterChoice, false);
+  assert.equal((await ack(first, "choose_starting_letter", { code: room.code, turnId: initial.turnId, letter: restored.startingLetterChoices[1] })).success, false);
+  const nextTurn = next(host, "turn_start");
+  const word = dictionary.find((candidate) => candidate.startsWith(letter));
+  assert.equal((await ack(first, "submit_word", { code: room.code, turnId: initial.turnId, word })).accepted, true);
+  const following = await nextTurn;
+  assert.equal(following.awaitingStartingLetterChoice, false);
+  assert.deepEqual(following.startingLetterChoices, []);
+  assert.ok(dictionary.some((candidate) => candidate !== word && candidate.startsWith(following.requiredPrefix)));
 });
 
 test("readiness automatically starts the shared countdown and unreadying or switching characters cancels it", { timeout: 20000 }, async (t) => {

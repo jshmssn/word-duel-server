@@ -4,7 +4,7 @@ const { EventEmitter } = require("node:events");
 const { FinishWordRounds, FINISH_WORD_CHARACTERS } = require("../src/socket/FinishWordSocket");
 const { FinishWordGame, MAX_WORD_LENGTH } = require("../src/services/FinishWordGame");
 
-function setup(t, { count = 3, start = true, dictionaryCount = 8 } = {}) {
+function setup(t, { count = 3, start = true, dictionaryCount = 8, chooseLetter = true } = {}) {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
   const players = Array.from({ length: count }, (_, index) => ({
     id: `player-${index}`, socketId: `socket-${index}`, username: `Player ${index}`,
@@ -17,7 +17,8 @@ function setup(t, { count = 3, start = true, dictionaryCount = 8 } = {}) {
   const manager = new FinishWordRounds({ rooms, dictionary,
     io: { to: (target) => ({ emit: (event, data) => events.push({ target, event, data: structuredClone(data) }) }) },
     publicPlayers: (target) => target.players.map((player) => ({ id: player.id, username: player.username, connected: player.connected, ready: player.ready, characterId: player.characterId, wins: player.wins })),
-    game: new FinishWordGame({ isValidWord: dictionary.isValidWord, randomLetter: () => "a", randomPlayerIndex: () => 0 }),
+    game: new FinishWordGame({ isValidWord: dictionary.isValidWord, random: () => 0, randomIndex: () => 0, randomPlayerIndex: () => 0,
+      getStartingPrefixes: (length, used = new Set()) => [...new Set([...words].filter((word) => !used.has(word)).map((word) => word.slice(0, length)))] }),
   });
   t.after(() => manager.clear(room.code));
   const makeSocket = (id, playerId = id) => {
@@ -31,7 +32,10 @@ function setup(t, { count = 3, start = true, dictionaryCount = 8 } = {}) {
     (typeof client === "number" ? sockets[client] : client).emit(event, { code: room.code, turnId: room.finishWordGame?.turnId, ...changes }, (reply) => { response = reply; });
     return response;
   };
-  if (start) manager.start(room);
+  if (start) {
+    manager.start(room);
+    if (chooseLetter) { act(0, "choose_starting_letter", { letter: "a" }); events.splice(0); manager.publish(room, true); }
+  }
   return { room, rooms, manager, events, queries, sockets, outsider, makeSocket, act };
 }
 
@@ -95,6 +99,29 @@ test("an empty dictionary cannot start a match or schedule a timer", (t) => {
   const { room, manager, events } = setup(t, { start: false, dictionaryCount: 0 });
   assert.throws(() => manager.start(room), /dictionary is empty/);
   assert.equal(room.state, "waiting"); assert.equal(manager.timers.size, 0); assert.equal(events.length, 0);
+});
+
+test("opening options are private to the first player's socket and only that player can lock one", (t) => {
+  const { room, manager, act, events, outsider } = setup(t, { count: 8, chooseLetter: false });
+  const publicState = events.find((entry) => entry.event === "turn_start").data;
+  assert.deepEqual(publicState.startingLetterChoices, []);
+  const choices = events.filter((entry) => entry.event === "starting_letter_choices");
+  assert.equal(choices.length, 1); assert.equal(choices[0].target, room.players[0].socketId);
+  assert.equal(new Set(choices[0].data.choices).size, 4);
+  assert.deepEqual(manager.snapshot(room, room.players[0].id).gameState.startingLetterChoices, choices[0].data.choices);
+  assert.deepEqual(manager.snapshot(room, room.players[1].id).gameState.startingLetterChoices, []);
+  assert.equal(act(1, "choose_starting_letter", { letter: "a" }).success, false);
+  assert.equal(act(outsider, "choose_starting_letter", { letter: "a" }).success, false);
+  assert.equal(act(0, "choose_starting_letter", { letter: "z" }).success, false);
+  const deadline = room.finishWordGame.turnEndsAt;
+  assert.equal(act(0, "choose_starting_letter", { letter: "a" }).success, true);
+  assert.equal(room.finishWordGame.turnEndsAt, deadline);
+  assert.equal(act(0, "choose_starting_letter", { letter: "e" }).success, false);
+  assert.equal(act(0, "submit_word", { word: "turtle", requiredPrefix: "t", successfulTurns: 100 }).accepted, false);
+  assert.equal(room.finishWordGame.successfulTurns, 0);
+  assert.equal(act(0, "submit_word", { word: "apple" }).accepted, true);
+  assert.equal(room.finishWordGame.currentTurnIndex, 1);
+  assert.equal(room.finishWordGame.requiredPrefix, "e");
 });
 
 test("typing broadcasts bounded plain text only for the active live turn and throttles rapid packets", (t) => {
