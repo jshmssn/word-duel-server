@@ -260,6 +260,26 @@ test("hard mode accepts a real two-letter continuation and carries its new suffi
   assert.equal(game.requiredPrefix, "rl");
 });
 
+test("an LL prompt rejects MALL and BALLOON and accepts LLAMA at the start", () => {
+  const { service, game, submit, queries } = fixture({ words: ["all", "mall", "balloon", "llama"] });
+  game.hardModeAfter = 1;
+  assert.equal(submit("all").accepted, true);
+  assert.equal(game.requiredPrefix, "ll");
+  const before = service.publicState(game);
+  for (const word of ["MALL", "balloon"]) {
+    const rejected = submit(word);
+    assert.equal(rejected.accepted, false);
+    assert.equal(rejected.reason, "wrong_prefix");
+    assert.equal(rejected.message, "Your word must start with LL.");
+    assert.equal(rejected.retryable, true);
+    assert.deepEqual(service.publicState(game), before);
+  }
+  assert.deepEqual(queries, ["all"]);
+  assert.equal(submit("LLAMA").accepted, true);
+  assert.equal(game.requiredPrefix, "ma");
+  assert.ok(game.players.every((player) => player.lives === 3));
+});
+
 test("live typing is bounded, sanitized, turn-scoped and cleared when a turn changes", () => {
   const { service, game, submit, setNow } = fixture();
   const action = (text, changes = {}) => service.updateTyping(game, { playerId: "one", text, turnId: game.turnId, ...changes });
