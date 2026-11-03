@@ -94,6 +94,26 @@ test("a browser app switch pauses immediately, and resuming the same connection 
   assert.equal(state.players.length, 2);
 });
 
+for (const gameMode of ["word-duel", "color-card"]) {
+  test(`${gameMode}: rooms stay available when all connected players switch apps`, async (t) => {
+    const { room, host, guest } = await roomFor(t, gameMode);
+    const hostPaused = next(guest, "ROOM_PAUSED");
+    host.emit("suspend-room", { code: room.code }); await hostPaused;
+    const guestPaused = next(host, "ROOM_PAUSED");
+    guest.emit("suspend-room", { code: room.code }); await guestPaused;
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    const hostRestored = next(host, "room-restored");
+    assert.equal((await ack(host, "resume-room", host.session)).success, true);
+    assert.equal((await hostRestored).players.length, 2);
+    const guestRestored = next(guest, "room-restored");
+    assert.equal((await ack(guest, "resume-room", guest.session)).success, true);
+    const state = await guestRestored;
+    assert.equal(state.screen, "game");
+    assert.equal(state.pausedAt, null);
+    assert.ok(state.players.every((player) => player.connected));
+  });
+}
+
 test("pending Word Duel questions remain answerable after reconnecting to a new socket", async (t) => {
   const { room, host, guest, states } = await roomFor(t, "word-duel");
   const asker = states[0].currentTurn === host.id ? host : guest;
@@ -111,26 +131,100 @@ test("pending Word Duel questions remain answerable after reconnecting to a new 
   assert.equal((await answered).askerId, asker.id);
 });
 
-test("waiting seats expire without a room pause; expired credentials cannot rejoin", async (t) => {
+test("waiting seats remain reserved past the old expiry while another player stays connected", async (t) => {
   const host = await connect(t), guest = await connect(t);
   const room = await ack(host, "CREATE_ROOM", { username: "Host", gameMode: "color-card" });
   const joined = next(guest, "room-joined");
   guest.emit("join-room", { code: room.code, username: "Guest" }); await joined;
   const session = host.session;
   let pauseCount = 0;
+  let departures = 0;
   guest.on("ROOM_PAUSED", () => pauseCount++);
+  guest.on("player-left", () => departures++);
   const presence = next(guest, "ready-update");
-  const lobby = next(guest, "rematch-lobby");
   host.io.engine.close();
   assert.equal((await presence).players.find((player) => player.id === session.playerId).connectionStatus, "reconnecting");
-  const state = await lobby;
+  await new Promise((resolve) => setTimeout(resolve, 650));
   assert.equal(pauseCount, 0);
-  assert.equal(state.pausedAt, null);
-  assert.equal(state.players.length, 1);
-  assert.equal(state.creatorId, guest.id);
+  assert.equal(departures, 0);
   const outsider = await connect(t);
   assert.equal((await ack(outsider, "resume-room", { ...session, token: "wrong" })).success, false);
-  assert.equal((await ack(outsider, "resume-room", session)).success, false);
+  const restored = next(outsider, "room-restored");
+  assert.equal((await ack(outsider, "resume-room", session)).success, true);
+  const state = await restored;
+  assert.equal(state.pausedAt, null);
+  assert.equal(state.players.length, 2);
+  assert.equal(state.creatorId, session.playerId);
+  assert.ok(state.players.every((player) => player.connected));
+});
+
+for (const gameMode of ["word-duel", "color-card", "finish-word"]) {
+  test(`${gameMode}: a connected waiting room survives idle time and app switches`, async (t) => {
+    const host = await connect(t);
+    const room = await ack(host, "CREATE_ROOM", { username: "Host", gameMode });
+    host.emit("suspend-room", { code: room.code });
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    const restored = next(host, "room-restored");
+    assert.equal((await ack(host, "resume-room", host.session)).success, true);
+    const snapshot = await restored;
+    assert.equal(snapshot.screen, "waiting");
+    assert.equal(snapshot.players.length, 1);
+    assert.equal(snapshot.players[0].connected, true);
+    const guest = await connect(t);
+    const joined = await ack(guest, "JOIN_ROOM", { code: room.code, username: "Guest" });
+    assert.equal(joined.success, true);
+    assert.equal(joined.players.length, 2);
+    assert.equal(joined.creatorId, host.session.playerId);
+  });
+
+  test(`${gameMode}: a room expires after every player disconnects`, async (t) => {
+    const host = await connect(t), guest = await connect(t);
+    const room = await ack(host, "CREATE_ROOM", { username: "Host", gameMode });
+    await ack(guest, "JOIN_ROOM", { code: room.code, username: "Guest" });
+    const session = host.session;
+    host.disconnect();
+    guest.disconnect();
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    const outsider = await connect(t);
+    assert.equal((await ack(outsider, "resume-room", session)).success, false);
+    const joined = await ack(outsider, "JOIN_ROOM", { code: room.code, username: "New player" });
+    assert.equal(joined.success, false);
+    assert.equal(joined.message, "Room not found.");
+  });
+}
+
+test("empty-room cleanup starts at the last disconnect and is cancelled by a returning player", async (t) => {
+  const host = await connect(t), guest = await connect(t);
+  const room = await ack(host, "CREATE_ROOM", { username: "Host", gameMode: "color-card" });
+  await ack(guest, "JOIN_ROOM", { code: room.code, username: "Guest" });
+  const session = host.session;
+  const presence = next(guest, "ready-update");
+  host.disconnect(); await presence;
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  guest.disconnect();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const recovered = await connect(t);
+  assert.equal((await ack(recovered, "resume-room", session)).success, true);
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  assert.equal((await ack(recovered, "resume-room", session)).success, true);
+  recovered.disconnect();
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  const outsider = await connect(t);
+  const joined = await ack(outsider, "JOIN_ROOM", { code: room.code, username: "New player" });
+  assert.equal(joined.message, "Room not found.");
+});
+
+test("quitting the last connected player starts cleanup even when disconnected seats remain", async (t) => {
+  const host = await connect(t), guest = await connect(t);
+  const room = await ack(host, "CREATE_ROOM", { username: "Host", gameMode: "color-card" });
+  await ack(guest, "JOIN_ROOM", { code: room.code, username: "Guest" });
+  const presence = next(host, "ready-update");
+  guest.disconnect(); await presence;
+  assert.equal((await ack(host, "leave-room", { code: room.code })).success, true);
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  const outsider = await connect(t);
+  const joined = await ack(outsider, "JOIN_ROOM", { code: room.code, username: "New player" });
+  assert.equal(joined.message, "Room not found.");
 });
 
 test("handshake credentials restore the same seat in a full lobby across repeated app switches", async (t) => {

@@ -469,9 +469,42 @@ function createRoomState(code, creatorId, username, { withBot = false, gameMode 
     pendingLetterAsk: null,
     pendingLetterCount: null,
     pausedAt: null,
+    emptyRoomTimer: null,
     kickVotes: new Map(),
     askedLetters: {},
   };
+}
+
+function clearEmptyRoomTimer(room) {
+  clearTimeout(room.emptyRoomTimer);
+  room.emptyRoomTimer = null;
+}
+
+function hasConnectedPlayers(room) {
+  return getHumanPlayers(room).some((player) => io.sockets.sockets.get(player.socketId)?.connected);
+}
+
+function deleteRoom(room) {
+  clearEmptyRoomTimer(room);
+  clearCountdown(room.code);
+  clearTurnTimer(room.code);
+  clearBotTimer(room.code);
+  colorCardRounds.clear(room.code);
+  finishWordRounds.clear(room.code);
+  room.players.forEach((player) => clearTimeout(player.kickTimer));
+  delete rooms[room.code];
+}
+
+function scheduleEmptyRoomCleanup(room) {
+  if (hasConnectedPlayers(room)) { clearEmptyRoomTimer(room); return; }
+  if (room.emptyRoomTimer) return;
+  // Give everyone a full reconnection window starting when the last player
+  // disconnects or leaves. An occupied room and its reserved seats never expire.
+  room.emptyRoomTimer = setTimeout(() => {
+    room.emptyRoomTimer = null;
+    if (rooms[room.code] === room && !hasConnectedPlayers(room)) deleteRoom(room);
+  }, RECONNECT_GRACE_MS);
+  room.emptyRoomTimer.unref();
 }
 
 function attachRoomSession(socket, room, player) {
@@ -482,12 +515,10 @@ function attachRoomSession(socket, room, player) {
   player.socketId = socket.id;
   player.connected = true;
   player.sessionToken ||= randomUUID();
-  clearTimeout(player.reconnectTimer);
-  player.reconnectTimer = null;
+  clearEmptyRoomTimer(room);
   clearTimeout(player.kickTimer);
   player.kickTimer = null;
   player.kickEligibleAt = null;
-  player.reconnectExpiresAt = null;
   room.kickVotes.delete(player.id);
   socket.emit("room-session", { code: room.code, playerId: player.id, token: player.sessionToken });
 }
@@ -540,7 +571,7 @@ function pauseRoom(room, player) {
   }
   io.to(room.code).emit("ROOM_PAUSED", {
     code: room.code, players: publicPlayers(room), pausedAt: room.pausedAt,
-    serverNow: Date.now(), expiresAt: player.reconnectExpiresAt,
+    serverNow: Date.now(),
     kickVotes: publicKickVotes(room),
     message: `${player.username} is reconnecting. The room and timers are paused.`,
   });
@@ -563,14 +594,14 @@ function resumeRoom(room) {
   if (room.state === "slotting") io.to(room.code).emit("category-selected", { category: room.category, selectedCategoryName: room.category });
 }
 
-function reserveSeat(room, player, socket, disconnected = false) {
+function reserveSeat(room, player, disconnected = false) {
   if (disconnected) colorCardRounds.resetPreviousMatch(room);
-  if (player.reconnectTimer) {
+  if (player.connected === false) {
     if (disconnected) pauseRoom(room, player);
+    scheduleEmptyRoomCleanup(room);
     return;
   }
   player.connected = false;
-  player.reconnectExpiresAt = Date.now() + RECONNECT_GRACE_MS;
   player.kickEligibleAt = Date.now() + RECONNECT_KICK_DELAY_MS;
   pauseRoom(room, player);
   player.kickTimer = setTimeout(() => {
@@ -579,13 +610,7 @@ function reserveSeat(room, player, socket, disconnected = false) {
     publishKickVotes(room);
   }, RECONNECT_KICK_DELAY_MS);
   player.kickTimer.unref();
-  player.reconnectTimer = setTimeout(() => {
-    if (rooms[room.code] === room && player.connected === false &&
-        (room.state === "waiting" || !getHumanPlayers(room).some((candidate) => candidate.connected !== false))) {
-      leaveRoom(socket, true);
-    }
-  }, RECONNECT_GRACE_MS);
-  player.reconnectTimer.unref();
+  scheduleEmptyRoomCleanup(room);
   if (room.pausedAt) publishKickVotes(room);
 }
 
@@ -609,8 +634,8 @@ function publishKickVotes(room) {
 function restoreRoomSession(socket, session) {
   const room = rooms[session?.code];
   const player = room?.players.find((candidate) => candidate.id === session?.playerId && candidate.sessionToken && candidate.sessionToken === session?.token);
-  if (!player || (player.connected === false && room.state === "waiting" && Date.now() >= player.reconnectExpiresAt)) {
-    throw new Error("Your room reservation expired. Join a room to play again.");
+  if (!player) {
+    throw new Error("Your room session is no longer available. Join a room to play again.");
   }
   if (socket.data.lobbyCode && (socket.data.lobbyCode !== room.code || lobbyPlayerId(socket) !== player.id)) throw new Error("You are already in another room.");
   const previousSocket = io.sockets.sockets.get(player.socketId);
@@ -635,7 +660,6 @@ function kickReconnectingPlayer(room, playerId) {
   if (index < 0) return;
   const oldPlayers = [...room.players];
   const [player] = room.players.splice(index, 1);
-  clearTimeout(player.reconnectTimer);
   clearTimeout(player.kickTimer);
   room.kickVotes.delete(playerId);
   const previousSocket = io.sockets.sockets.get(player.socketId);
@@ -679,7 +703,7 @@ function kickReconnectingPlayer(room, playerId) {
   } else resumeRoom(room);
 }
 
-// Explicit quits and expired reconnection reservations release room resources.
+// Explicit quits release seats; only rooms with no connected humans expire.
 function leaveRoom(socket, disconnected = false) {
   const code = socket.data.lobbyCode;
   const room = rooms[code];
@@ -690,13 +714,12 @@ function leaveRoom(socket, disconnected = false) {
   }
   const [left] = room.players.splice(index, 1);
   colorCardRounds.resetPreviousMatch(room);
-  clearTimeout(left.reconnectTimer);
   clearTimeout(left.kickTimer);
   room.kickVotes.delete(left.id);
   if (room.gameMode === "finish-word" && room.state === "playing") {
     socket.leave(code); socket.leave(left.id); socket.data.lobbyCode = null;
     if (!getHumanPlayers(room).length) {
-      finishWordRounds.clear(code); delete rooms[code]; return;
+      deleteRoom(room); return;
     }
     if (room.creatorId === left.id) room.creatorId = getHumanPlayers(room)[0].id;
     finishWordRounds.removePlayer(room, left.id);
@@ -706,6 +729,7 @@ function leaveRoom(socket, disconnected = false) {
       if (room.players.some((player) => player.connected === false)) { publishKickVotes(room); sendRoomSnapshots(room); }
       else resumeRoom(room);
     }
+    scheduleEmptyRoomCleanup(room);
     return;
   }
   const cancelled = !["waiting", "ended"].includes(room.state);
@@ -737,7 +761,7 @@ function leaveRoom(socket, disconnected = false) {
   io.to(code).emit("chat-message", message);
   io.to(code).emit("player-left", { code, playerId: left.id, username: left.username, disconnected, message: text });
   if (!getHumanPlayers(room).length) {
-    delete rooms[code];
+    deleteRoom(room);
     return;
   }
   room.state = "waiting";
@@ -745,6 +769,7 @@ function leaveRoom(socket, disconnected = false) {
   room.players.forEach((player) => { player.ready = isBotPlayer(player); });
   broadcastReadyState(code);
   io.to(code).emit("rematch-lobby", { ...lobbyState(room), message: text, departure: true });
+  scheduleEmptyRoomCleanup(room);
 }
 
 io.on("connection", (socket) => {
@@ -765,7 +790,8 @@ io.on("connection", (socket) => {
   socket.on("suspend-room", (payload = {}) => {
     const room = rooms[socket.data.lobbyCode];
     const player = room?.players.find((candidate) => candidate.id === lobbyPlayerId(socket));
-    if (room && player && payload.code === room.code) reserveSeat(room, player, socket);
+    // A background waiting tab is still present while its socket is connected.
+    if (room && player && payload.code === room.code && room.state !== "waiting") reserveSeat(room, player);
   });
 
   socket.on("resume-room", (payload = {}, reply) => {
@@ -1084,7 +1110,7 @@ io.on("connection", (socket) => {
     const room = rooms[socket.data.lobbyCode];
     const player = room?.players.find((candidate) => candidate.id === lobbyPlayerId(socket));
     if (!player || player.socketId !== socket.id) return;
-    reserveSeat(room, player, socket, true);
+    reserveSeat(room, player, true);
   });
 
   if (socket.handshake.auth?.session) {

@@ -114,12 +114,10 @@ test("Color Card previous-match averages survive rematches, then reset after a d
   const restored = next(host, "room-restored");
   assert.equal((await ack(host, "resume-room", session)).success, true);
   assert.ok((await restored).players.every((player) => player.previousMatchAverageAccuracy === 100));
-  const backgrounded = next(guest, "ready-update", 4000, (state) => state.players.some((player) => player.connected === false));
   host.emit("suspend-room", { code: room.code });
-  assert.ok((await backgrounded).players.every((player) => player.previousMatchAverageAccuracy === 100));
   const foregrounded = next(host, "room-restored");
   await ack(host, "resume-room", session);
-  assert.ok((await foregrounded).players.every((player) => player.previousMatchAverageAccuracy === 100));
+  assert.ok((await foregrounded).players.every((player) => player.connected && player.previousMatchAverageAccuracy === 100));
   const paused = next(guest, "ready-update", 4000, (state) => state.players.some((player) => player.connected === false));
   host.io.engine.close();
   assert.ok((await paused).players.every((player) => player.previousMatchAverageAccuracy === 0 && player.previousMatchCardCount === 0));
