@@ -40,6 +40,7 @@ test("automatic phases keep all players on each unique card and stop at the conf
       assert.equal(entry.data.entries[0].id, entry.target);
       assert.equal(entry.data.entries[0].autoSubmitted, true);
       assert.equal(entry.data.entries[0].accuracy, 100);
+      assert.equal(entry.data.reviewEndsAt - entry.data.serverNow, entry.data.reviewDuration * 1000);
     });
     t.mock.timers.tick(4999);
     assert.equal(room.state, "review");
@@ -47,6 +48,7 @@ test("automatic phases keep all players on each unique card and stop at the conf
     const ranking = events.filter((entry) => entry.event === "COLOR_RANKINGS").at(-1).data;
     assert.equal(ranking.entries.length, 2);
     assert.equal(ranking.totalRounds, 3);
+    assert.equal(ranking.rankingEndsAt - ranking.serverNow, ranking.rankingDuration * 1000);
     if (card < 3) {
       assert.equal(room.state, "ranking");
       t.mock.timers.tick(9999);

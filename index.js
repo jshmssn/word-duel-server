@@ -655,6 +655,23 @@ function restoreRoomSession(socket, session) {
   }
 }
 
+function resetRoomToWaiting(room) {
+  clearCountdown(room.code);
+  clearTurnTimer(room.code);
+  clearBotTimer(room.code);
+  colorCardRounds.clear(room.code);
+  finishWordRounds.clear(room.code);
+  Object.assign(room, {
+    state: "waiting", finishWordGame: null, colorRound: null, colorMatch: null,
+    colorRanking: null, colorReviewEndsAt: null, lastResult: null,
+    pendingLetterAsk: null, pendingLetterCount: null, currentTurn: null,
+    words: {}, confirmedLetters: {}, askedLetters: {}, guessAttempts: {},
+    pendingCategory: null, slotDoneIds: null, pausedAt: null,
+  });
+  room.kickVotes.clear();
+  room.players.forEach((player) => { player.ready = isBotPlayer(player); });
+}
+
 function kickReconnectingPlayer(room, playerId) {
   const index = room.players.findIndex((player) => player.id === playerId && player.connected === false);
   if (index < 0) return;
@@ -669,6 +686,16 @@ function kickReconnectingPlayer(room, playerId) {
     previousSocket.data.lobbyCode = null;
   }
   if (room.creatorId === playerId) room.creatorId = getHumanPlayers(room)[0]?.id || room.players[0]?.id;
+  if (room.players.length < 2) {
+    resetRoomToWaiting(room);
+    const message = `${player.username} was removed by a majority vote. Waiting for another player to join.`;
+    io.to(room.code).emit("player-left", { code: room.code, playerId, username: player.username, message });
+    broadcastReadyState(room.code);
+    io.to(room.code).emit("rematch-lobby", { ...lobbyState(room), message, departure: true });
+    sendRoomSnapshots(room);
+    scheduleEmptyRoomCleanup(room);
+    return;
+  }
   if (room.gameMode === "color-card") colorCardRounds.removePlayer(room, playerId);
   else if (room.gameMode === "finish-word") finishWordRounds.removePlayer(room, playerId);
   else {
@@ -684,16 +711,6 @@ function kickReconnectingPlayer(room, playerId) {
     if (room.currentTurn === playerId) {
       room.currentTurn = room.players[index % room.players.length]?.id;
       room.turnRemaining = room.turnDuration;
-    }
-    if (room.state === "playing" && room.players.length === 1) {
-      const winner = room.players[0];
-      winner.wins = (winner.wins || 0) + 1;
-      room.state = "ended";
-      const seriesState = getSeriesState(room, winner.id);
-      room.seriesOver = seriesState.seriesOver;
-      room.lastResult = { winnerId: winner.id, winnerName: winner.username, winnerWins: winner.wins,
-        players: publicPlayers(room), wordsByPlayer: { ...room.words }, ...seriesState };
-      io.to(room.code).emit("game-over", room.lastResult);
     }
   }
   const message = `${player.username} was removed by a majority vote.`;
@@ -735,24 +752,7 @@ function leaveRoom(socket, disconnected = false) {
   const cancelled = !["waiting", "ended"].includes(room.state);
   socket.leave(code);
   socket.data.lobbyCode = null;
-  clearCountdown(code);
-  clearTurnTimer(code);
-  clearBotTimer(code);
-  colorCardRounds.clear(code);
-  finishWordRounds.clear(code);
-  room.finishWordGame = null;
-  room.colorRound = null;
-  room.colorMatch = null;
-  room.colorRanking = null;
-  room.pendingLetterAsk = null;
-  room.pendingLetterCount = null;
-  room.currentTurn = null;
-  room.words = {};
-  room.confirmedLetters = {};
-  room.pendingCategory = null;
-  room.slotDoneIds = null;
-  room.pausedAt = null;
-  room.kickVotes.clear();
+  resetRoomToWaiting(room);
 
   const text = `${left.username} ${disconnected ? "disconnected" : "quit the room"}.${cancelled ? " The round was cancelled; ready up to play again." : ""}`;
   const message = { id: Date.now() + Math.random(), system: true, text, timestamp: Date.now() };
@@ -764,9 +764,7 @@ function leaveRoom(socket, disconnected = false) {
     deleteRoom(room);
     return;
   }
-  room.state = "waiting";
   if (room.creatorId === left.id) room.creatorId = getHumanPlayers(room)[0].id;
-  room.players.forEach((player) => { player.ready = isBotPlayer(player); });
   broadcastReadyState(code);
   io.to(code).emit("rematch-lobby", { ...lobbyState(room), message: text, departure: true });
   scheduleEmptyRoomCleanup(room);

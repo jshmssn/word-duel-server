@@ -203,7 +203,8 @@ class ColorCardRounds {
     const reviewEndsAt = this.game.now() + RESULT_REVIEW_MS;
     room.colorReviewEndsAt = reviewEndsAt;
     const rankingEndsAt = reviewEndsAt + RANKING_MS;
-    room.colorRanking = { ...result, ...matchState, code: room.code, players: this.publicPlayers(room), rankingEndsAt };
+    room.colorRanking = { ...result, ...matchState, code: room.code, players: this.publicPlayers(room), rankingEndsAt,
+      reviewDuration: RESULT_REVIEW_MS / 1000, rankingDuration: RANKING_MS / 1000 };
     // Each player reviews their own answer first; rankings are revealed together.
     room.players.forEach((player) => this.io.to(player.id).emit("ROUND_RESULTS", {
       code: room.code, roundId: result.roundId, matchId: matchState.matchId,
@@ -211,7 +212,7 @@ class ColorCardRounds {
       totalRounds: matchState.totalRounds, matchComplete: matchState.matchComplete,
       entries: result.entries.filter((entry) => entry.id === player.id),
       winners: [], winnerIds: [], standings: [], matchWinnerIds: [],
-      players: this.publicPlayers(room), reason, reviewEndsAt, serverNow: this.game.now(),
+      players: this.publicPlayers(room), reason, reviewEndsAt, reviewDuration: RESULT_REVIEW_MS / 1000, serverNow: this.game.now(),
     }));
     this.schedule(room);
   }

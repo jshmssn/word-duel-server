@@ -272,10 +272,16 @@ async function kickRoom(t, gameMode, count = 4) {
     socket.emit("JOIN_ROOM", { code: room.code, username: `Player ${index}` }); await joined;
     sockets.push(socket);
   }
+  if (gameMode === "finish-word") {
+    const characters = ["knight", "wizard", "ninja", "robot", "alien", "pirate", "astronaut", "dino"];
+    for (const [index, socket] of sockets.entries()) {
+      assert.equal((await ack(socket, "select_character", { code: room.code, characterId: characters[index] })).success, true);
+    }
+  }
   for (const socket of sockets) {
     const ready = next(host, "ready-update"); socket.emit("toggle-ready", { code: room.code }); await ready;
   }
-  const started = next(host, gameMode === "color-card" ? "START_GAME" : "category-selected");
+  const started = next(host, gameMode === "color-card" ? "START_GAME" : gameMode === "finish-word" ? "turn_start" : "category-selected");
   await ack(host, "START_GAME", { code: room.code });
   let state = await started;
   if (gameMode === "word-duel") {
@@ -349,25 +355,47 @@ test("returning after a kick vote opens cancels the vote and preserves the sessi
   assert.equal((await ack(guest, "VOTE_ROOM_KICK", { code: room.code, playerId: host.session.playerId, voteId: vote.id, choice: "yes" })).success, false);
 });
 
-for (const gameMode of ["color-card", "word-duel"]) {
-  test(`${gameMode}: the sole active player can remove a reconnecting opponent`, async (t) => {
+for (const gameMode of ["color-card", "word-duel", "finish-word"]) {
+  test(`${gameMode}: kicking the last opponent returns the remaining player to the waiting room`, async (t) => {
     const { room, sockets, state } = await kickRoom(t, gameMode, 2);
     const [target, active] = sockets;
+    const kickedSession = target.session;
+    const victories = [];
+    active.on("game-over", (result) => victories.push(result));
+    active.on("game_over", (result) => victories.push(result));
     const opened = openKickVote(active);
-    target.emit("suspend-room", { code: room.code });
+    target.disconnect();
     const vote = await opened;
     assert.equal(vote.requiredYes, 1);
+    const lobby = next(active, "rematch-lobby");
     const restored = next(active, "room-restored");
-    assert.equal((await ack(active, "VOTE_ROOM_KICK", { code: room.code, playerId: target.session.playerId, voteId: vote.id, choice: "yes" })).success, true);
+    assert.equal((await ack(active, "VOTE_ROOM_KICK", { code: room.code, playerId: kickedSession.playerId, voteId: vote.id, choice: "yes" })).success, true);
+    assert.equal((await lobby).departure, true);
     const snapshot = await restored;
     assert.equal(snapshot.pausedAt, null);
+    assert.equal(snapshot.screen, "waiting");
+    assert.equal(snapshot.code, room.code);
+    assert.equal(snapshot.creatorId, active.session.playerId);
     assert.equal(snapshot.players.length, 1);
+    assert.equal(snapshot.players[0].ready, false);
+    assert.equal(snapshot.players[0].wins, 0);
+    assert.deepEqual(snapshot.kickVotes, []);
+    assert.equal(snapshot.gameState, undefined);
+    assert.equal(snapshot.result, undefined);
+    assert.deepEqual(victories, []);
+    const newcomer = await connect(t);
+    assert.equal((await ack(newcomer, "resume-room", kickedSession)).success, false);
+    const joined = await ack(newcomer, "JOIN_ROOM", { code: room.code, username: "New opponent" });
+    assert.equal(joined.success, true);
+    assert.equal(joined.players.length, 2);
     if (gameMode === "color-card") {
-      assert.equal(snapshot.gameState.roundId, state.roundId);
-      assert.equal(snapshot.screen, "game");
-    } else {
-      assert.equal(snapshot.screen, "gameover");
-      assert.equal(snapshot.result.winnerId, active.session.playerId);
+      for (const socket of [active, newcomer]) assert.equal((await ack(socket, "toggle-ready", { code: room.code })).success, true);
+      const started = next(active, "START_GAME");
+      assert.equal((await ack(active, "START_GAME", { code: room.code })).success, true);
+      const fresh = await started;
+      assert.notEqual(fresh.roundId, state.roundId);
+      assert.notEqual(fresh.matchId, state.matchId);
+      assert.equal(fresh.roundNumber, 1);
     }
   });
 }
